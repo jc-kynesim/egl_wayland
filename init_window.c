@@ -19,6 +19,8 @@
 
 #include <math.h>
 
+#include <sys/eventfd.h>
+#include <sys/poll.h>
 #include <sys/time.h>
 
 #include <epoxy/gl.h>
@@ -83,6 +85,7 @@ struct egl_wayland_out_env
 	pthread_mutex_t q_lock;
 	sem_t display_start_sem;
 	sem_t q_sem;
+	int prod_fd;
 	int q_terminate;
 	AVFrame *q_this;
 	AVFrame *q_next;
@@ -377,6 +380,9 @@ static void* display_thread(void *v)
 {
 	egl_wayland_out_env_t *const de = v;
 	struct _escontext *const es = &ESContext;
+	struct pollfd pollfds[2];
+	int wl_fd;
+	int wl_poll_out = 0;
 
 #if TRACE_ALL
 	LOG("<<< %s\n", __func__);
@@ -406,31 +412,67 @@ static void* display_thread(void *v)
 #endif
 	sem_post(&de->display_start_sem);
 
-	for (;;)
+	wl_fd = wl_display_get_fd(es->native_display);
+
+	while (!de->q_terminate)
 	{
 		AVFrame *frame;
+		int rv;
 
-		while (sem_wait(&de->q_sem) != 0)
-		{
-			assert(errno == EINTR);
+		for(;;) {
+			wl_display_dispatch_pending(es->native_display);
+			if (wl_display_prepare_read(es->native_display) == 0)
+				break;
+			if (errno != EAGAIN)
+			{
+				LOG("prepared_read: %s\n", strerror(errno));
+				break;
+			}
 		}
 
-		if (de->q_terminate)
+		wl_poll_out = 0;
+		if (wl_display_flush(es->native_display) == -1 && errno == EAGAIN)
+			wl_poll_out = 1;
+
+		pollfds[0] = (struct pollfd){.fd = de->prod_fd, .events = POLLIN};
+		pollfds[1] = (struct pollfd){.fd = wl_fd, .events = wl_poll_out ? POLLIN | POLLOUT : POLLIN};
+
+		do {
+			rv = poll(pollfds, 2, -1);
+		} while (rv < 0 && errno == EINTR);
+
+		if (rv < 0)
+		{
+			LOG("Poll failed: %s\n", strerror(errno));
 			break;
+		}
+		if (rv == 0)
+		{
+			LOG("Poll unexpected timeout\n");
+			break;
+		}
 
-		wl_display_dispatch_pending(es->native_display);
+		if (wl_display_read_events(es->native_display) != 0)
+			LOG("Read Event Failed\n");
 
-		pthread_mutex_lock(&de->q_lock);
-		frame = de->q_next;
-		de->q_next = NULL;
-		pthread_mutex_unlock(&de->q_lock);
+		if (pollfds[0].revents)
+		{
+			uint64_t rcount = 0;
+			if (read(de->prod_fd, &rcount, sizeof(rcount)) != sizeof(rcount))
+				LOG("Unrexpected prod read");
 
-		do_display(de, es, frame);
+			pthread_mutex_lock(&de->q_lock);
+			frame = de->q_next;
+			de->q_next = NULL;
+			pthread_mutex_unlock(&de->q_lock);
 
-		wl_display_dispatch_pending(es->native_display);
-
-		av_frame_free(&de->q_this);
-		de->q_this = frame;
+			if (frame)
+			{
+				do_display(de, es, frame);
+				av_frame_free(&de->q_this);
+				de->q_this = frame;
+			}
+		}
 	}
 
 #if TRACE_ALL
@@ -781,6 +823,20 @@ void egl_wayland_out_modeset(struct egl_wayland_out_env *dpo, int w, int h, AVRa
 	/* NIF */
 }
 
+void
+display_prod(struct egl_wayland_out_env *de)
+{
+	static const uint64_t one = 1;
+	int rv;
+
+	do {
+		rv = write(de->prod_fd, &one, sizeof(one));
+	} while (rv == -1 && errno == EINTR);
+
+	if (rv != sizeof(one))
+		LOG("Event prod failed!\n");
+}
+
 int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 {
 	AVFrame *frame = NULL;
@@ -826,7 +882,7 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 	pthread_mutex_unlock(&de->q_lock);
 
 	if (frame == NULL)
-		sem_post(&de->q_sem);
+		display_prod(de);
 	else
 		av_frame_free(&frame);
 
@@ -837,6 +893,11 @@ struct egl_wayland_out_env* egl_wayland_out_new(void)
 {
 	struct egl_wayland_out_env *de = malloc(sizeof(*de));
 	unsigned int i;
+
+	de->prod_fd = -1;
+	de->q_terminate = 0;
+	pthread_mutex_init(&de->q_lock, NULL);
+	sem_init(&de->display_start_sem, 0, 0);
 
 	get_server_references();
 
@@ -868,11 +929,9 @@ struct egl_wayland_out_env* egl_wayland_out_new(void)
 		de->aux[i].fd = -1;
 	}
 
-	de->q_terminate = 0;
-	pthread_mutex_init(&de->q_lock, NULL);
-	sem_init(&de->q_sem, 0, 0);
-	sem_init(&de->display_start_sem, 0, 0);
-	assert(pthread_create(&de->q_thread, NULL, display_thread, de) == 0);
+    de->prod_fd = eventfd(0, EFD_NONBLOCK);
+
+    assert(pthread_create(&de->q_thread, NULL, display_thread, de) == 0);
 
 	sem_wait(&de->display_start_sem);
 	if (de->q_terminate)
@@ -896,10 +955,11 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 	LOG("<<< %s\n", __func__);
 
 	de->q_terminate = 1;
-	sem_post(&de->q_sem);
+	display_prod(de);
 	pthread_join(de->q_thread, NULL);
-	sem_destroy(&de->q_sem);
-	pthread_mutex_destroy(&de->q_lock);
+    if (de->prod_fd != -1)
+        close(de->prod_fd);
+    pthread_mutex_destroy(&de->q_lock);
 
 	av_frame_free(&de->q_next);
 	av_frame_free(&de->q_this);
