@@ -34,6 +34,8 @@
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_drm.h"
 
+#define TRACE_ALL 0
+
 struct wl_compositor *compositor = NULL;
 struct wl_surface *surface;
 struct wl_egl_window *egl_window;
@@ -842,7 +844,7 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 	AVFrame *frame = NULL;
 
 #if TRACE_ALL
-	LOG("%s\n", __func__);
+	LOG("<<< %s\n", __func__);
 #endif
 
 	if (src_frame->format == AV_PIX_FMT_DRM_PRIME)
@@ -891,7 +893,7 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 
 struct egl_wayland_out_env* egl_wayland_out_new(void)
 {
-	struct egl_wayland_out_env *de = malloc(sizeof(*de));
+	struct egl_wayland_out_env *de = calloc(1, sizeof(*de));
 	unsigned int i;
 
 	de->prod_fd = -1;
