@@ -361,6 +361,14 @@ int main(int argc, char *argv[])
                 --n;
                 ++a;
             }
+            else if (strcmp(arg, "-O") == 0) {
+                if (av_dict_parse_string(&codec_opts, *a, "=", ":", 0) != 0) {
+                    fprintf(stderr, "Bad codec opts '%s': usage: <opt>=<value[:<opt>=<value>]^\n", *a);
+                    usage();
+                }
+                --n;
+                ++a;
+            }
             else if (strcmp(arg, "--pace-input") == 0) {
                 if (n == 0)
                     usage();
@@ -484,8 +492,6 @@ loopy:
 
     decoder_ctx->thread_count = 3;
     decoder_ctx->flags = AV_CODEC_FLAG_LOW_DELAY;
-
-    av_dict_set(&codec_opts, "meson_alloc", "1", 0);
 
     if ((ret = avcodec_open2(decoder_ctx, decoder, &codec_opts)) < 0) {
         fprintf(stderr, "Failed to open codec for stream #%u\n", video_stream);
