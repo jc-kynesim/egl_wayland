@@ -65,17 +65,3 @@ executable('hello_egl_wayland',
     dependency('libavutil'),
   ]
 )
-cc = meson.get_compiler('c')
-rt_dep = cc.find_library('rt')
-
-executable('example1',
-  ['example1.c'] + protocols_files,
-  install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep,
-    threads_dep,
-	rt_dep,
-  ]
-)
-
-
-

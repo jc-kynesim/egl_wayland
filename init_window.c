@@ -59,8 +59,11 @@ struct _escontext
 	struct wl_egl_window *native_window;
 	struct wl_compositor *w_compositor;
 	struct wl_surface *w_surface;
+	struct wl_surface *w_surface2;
+	struct wl_subsurface *w_subsurface2;
 	struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1_bind;
 	struct wl_shm *w_shm;
+	struct wl_subcompositor *w_subcompositor;
 
 	EGLDisplay display;
 	EGLContext context;
@@ -246,15 +249,37 @@ check_support(const struct _escontext *const es, const uint32_t fmt, const uint6
 	return 0;
 }
 
+struct dmabuf_w_env_s {
+	AVBufferRef * buf;
+	struct _escontext * es;
+};
+
+static struct dmabuf_w_env_s *
+dmabuf_w_env_new(struct _escontext *const es, AVBufferRef * const buf)
+{
+	struct dmabuf_w_env_s * const dbe = malloc(sizeof(*dbe));
+	if (!dbe)
+		return NULL;
+	dbe->buf = av_buffer_ref(buf);
+	dbe->es = es;
+	return dbe;
+}
+
+static void
+dmabuf_w_env_delete(struct dmabuf_w_env_s * const dbe)
+{
+	av_buffer_unref(&dbe->buf);
+	free(dbe);
+}
 
 static void
 w_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
-	AVBufferRef * buf = wl_buffer_get_user_data(wl_buffer);
-	(void)data;
+	struct dmabuf_w_env_s * const dbe = data;
+
 	/* Sent by the compositor when it's no longer using this buffer */
 	wl_buffer_destroy(wl_buffer);
-	av_buffer_unref(&buf);
+	dmabuf_w_env_delete(dbe);
 }
 
 static const struct wl_buffer_listener w_buffer_listener = {
@@ -265,10 +290,9 @@ static void
 create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params,
 		 struct wl_buffer *new_buffer)
 {
-//	struct _escontext * const es = data;
-	struct _escontext * const es = &ESContext;
-	AVBufferRef * buf = zwp_linux_buffer_params_v1_get_user_data(params);
-	(void)new_buffer;
+	struct dmabuf_w_env_s * const dbe = data;
+	struct _escontext * const es = dbe->es;
+	AVBufferRef * buf = dbe->buf;
 #if 0
 	ConstructBufferData *d = data;
 
@@ -277,33 +301,34 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 	g_cond_signal(&d->cond);
 	g_mutex_unlock(&d->lock);
 #endif
-	printf("%s: ok\n", __func__);
+	printf("%s: ok data=%p, buf=%p, es=%p\n", __func__, data, (void*)buf, (void*)es);
 	fflush(stdout);
 	zwp_linux_buffer_params_v1_destroy(params);
 
-	wl_buffer_set_user_data(new_buffer, buf);
-	wl_buffer_add_listener(new_buffer, &w_buffer_listener, data);
+	wl_buffer_add_listener(new_buffer, &w_buffer_listener, dbe);
 
     // *************
     assert(es->sig == ES_SIG);
     if (0)
     {
 	wl_buffer_destroy(new_buffer);
-	av_buffer_unref(&buf);
+	dmabuf_w_env_delete(dbe);
     new_buffer = draw_frame(es);
     }
     // *************
 
-	(void)es;
+	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
+	wl_surface_damage(es->w_surface2, 0, 0, INT32_MAX, INT32_MAX);
+
 	wl_surface_attach(es->w_surface, new_buffer, 0, 0);
+	wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
 	wl_surface_commit(es->w_surface);
 }
 
 static void
 create_wl_dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 {
-	AVBufferRef * buf = zwp_linux_buffer_params_v1_get_user_data(params);
-	(void)data;
+	struct dmabuf_w_env_s * const dbe = data;
 #if 0
 	ConstructBufferData *d = data;
 
@@ -315,7 +340,7 @@ create_wl_dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 	(void)data;
 	printf("%s: FAILED\n", __func__);
 	zwp_linux_buffer_params_v1_destroy(params);
-	av_buffer_unref(&buf);
+	dmabuf_w_env_delete(dbe);
 }
 
 static const struct zwp_linux_buffer_params_v1_listener params_wl_dmabuf_listener = {
@@ -369,8 +394,8 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
     assert(es->sig == ES_SIG);
 
     /* Request buffer creation */
-	zwp_linux_buffer_params_v1_add_listener(params, &params_wl_dmabuf_listener, es);
-	zwp_linux_buffer_params_v1_set_user_data(params, av_buffer_ref(frame->buf[0]));
+	zwp_linux_buffer_params_v1_add_listener(params, &params_wl_dmabuf_listener,
+		dmabuf_w_env_new(es, frame->buf[0]));
 
 	zwp_linux_buffer_params_v1_create(params, width, height, format, flags);
 
@@ -1080,6 +1105,8 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 	}
 	if (strcmp(interface, wl_shm_interface.name) == 0)
 		es->w_shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
+	if (strcmp(interface, wl_subcompositor_interface.name) == 0)
+		es->w_subcompositor = wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
 
 	if (strcmp(interface, xdg_wm_base_interface.name) == 0)
 	{
@@ -1298,6 +1325,13 @@ wayland_out_new(const bool is_egl)
 	XDGToplevel = xdg_surface_get_toplevel(XDGSurface);
 	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
 	xdg_toplevel_add_listener(XDGToplevel, &xdg_toplevel_listener, es);
+
+	es->w_surface2 = wl_compositor_create_surface(es->w_compositor);
+	es->w_subsurface2 = wl_subcompositor_get_subsurface(es->w_subcompositor, es->w_surface2, es->w_surface);
+	wl_subsurface_place_below(es->w_subsurface2, es->w_surface);
+	wl_subsurface_set_sync(es->w_subsurface2);
+
+	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
 
 	wl_surface_commit(es->w_surface);
 
