@@ -51,16 +51,31 @@ endforeach
 extra_c_args = [
 ]
 
+dep_rt = meson.get_compiler('c').find_library('rt')
+
 executable('hello_egl_wayland',
   wl_sources + protocols_files,
   install : true,
   dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
     threads_dep,
+    dep_rt,
     dependency('libavcodec'),
     dependency('libavfilter'),
     dependency('libavformat'),
     dependency('libavutil'),
   ]
 )
+cc = meson.get_compiler('c')
+rt_dep = cc.find_library('rt')
+
+executable('example1',
+  ['example1.c'] + protocols_files,
+  install : true,
+  dependencies : [wl_client_dep, wl_protocol_dep,
+    threads_dep,
+	rt_dep,
+  ]
+)
+
 
 
