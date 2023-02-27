@@ -312,7 +312,11 @@ int main(int argc, char *argv[])
     int video_stream, ret;
     AVStream *video = NULL;
     AVCodecContext *decoder_ctx = NULL;
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+    const AVCodec *decoder = NULL;
+#else
     AVCodec *decoder = NULL;
+#endif
     AVPacket packet;
     enum AVHWDeviceType type;
     const char * in_file;
@@ -327,6 +331,7 @@ int main(int argc, char *argv[])
     const char * out_name = NULL;
     bool wants_deinterlace = false;
     long pace_input_hz = 0;
+    bool use_dmabuf = false;
 
     {
         char * const * a = argv + 1;
@@ -369,7 +374,9 @@ int main(int argc, char *argv[])
                 --n;
                 ++a;
             }
-            else if (strcmp(arg, "--pace-input") == 0) {
+            else if (strcmp(arg, "-d") == 0) {
+                use_dmabuf = true;
+            } else if (strcmp(arg, "--pace-input") == 0) {
                 if (n == 0)
                     usage();
                 pace_input_hz = strtol(*a, &e, 0);
@@ -408,7 +415,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    dpo = egl_wayland_out_new();
+    dpo = use_dmabuf ? dmabuf_wayland_out_new() : egl_wayland_out_new();
     if (dpo == NULL) {
         fprintf(stderr, "Failed to open egl_wayland output\n");
         return 1;

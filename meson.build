@@ -31,6 +31,7 @@ protocol_defs = [
     ['/unstable/fullscreen-shell/fullscreen-shell-unstable-v1.xml',
      'fullscreen-shell-unstable-v1-protocol.c', 'fullscreen-shell-unstable-v1-client-protocol.h'],
     ['/stable/xdg-shell/xdg-shell.xml', 'xdg-shell-protocol.c', 'xdg-shell-client-protocol.h'],
+    ['/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml', 'xdg-decoration-unstable-v1-protocol.c', 'xdg-decoration-unstable-v1-client-protocol.h'],
 ]
 protocols_files = []
 

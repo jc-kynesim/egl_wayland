@@ -6,6 +6,7 @@
 #include <wayland-egl.h> // Wayland EGL MUST be included before EGL headers
 
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
 #include "init_window.h"
@@ -64,7 +65,7 @@ struct _escontext
 	struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1_bind;
 	struct wl_shm *w_shm;
 	struct wl_subcompositor *w_subcompositor;
-
+    struct zxdg_decoration_manager_v1 *x_decoration;
 	EGLDisplay display;
 	EGLContext context;
 	EGLSurface surface;
@@ -317,8 +318,9 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
     }
     // *************
 
-	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
-	wl_surface_damage(es->w_surface2, 0, 0, INT32_MAX, INT32_MAX);
+//	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
+//	wl_surface_damage(es->w_surface2, 0, 0, INT32_MAX, INT32_MAX);
+//    wl_surface_commit(es->w_surface2);
 
 	wl_surface_attach(es->w_surface, new_buffer, 0, 0);
 	wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -1090,6 +1092,20 @@ static const struct zwp_linux_dmabuf_v1_listener linux_dmabuf_v1_listener = {
 	.modifier = linux_dmabuf_v1_listener_modifier,
 };
 
+static void
+decoration_configure(void *data,
+			  struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1,
+			  uint32_t mode)
+{
+    (void)data;
+    printf("%s[%p]: mode %d\n", __func__, (void*)zxdg_toplevel_decoration_v1, mode);
+    zxdg_toplevel_decoration_v1_destroy(zxdg_toplevel_decoration_v1);
+}
+
+static struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
+    .configure = decoration_configure,
+};
+
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id,
 									const char *interface, uint32_t version)
 {
@@ -1107,12 +1123,13 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 		es->w_shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
 	if (strcmp(interface, wl_subcompositor_interface.name) == 0)
 		es->w_subcompositor = wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
-
 	if (strcmp(interface, xdg_wm_base_interface.name) == 0)
 	{
 		XDGWMBase = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(XDGWMBase, &xdg_wm_base_listener, NULL);
 	}
+	if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
+        es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
 }
 
 static void global_registry_remover(void *data, struct wl_registry *registry, uint32_t id)
@@ -1326,12 +1343,22 @@ wayland_out_new(const bool is_egl)
 	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
 	xdg_toplevel_add_listener(XDGToplevel, &xdg_toplevel_listener, es);
 
+    {
+        struct zxdg_toplevel_decoration_v1 * const decobj =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(es->x_decoration, XDGToplevel);
+        zxdg_toplevel_decoration_v1_set_mode(decobj, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
+    }
+
 	es->w_surface2 = wl_compositor_create_surface(es->w_compositor);
 	es->w_subsurface2 = wl_subcompositor_get_subsurface(es->w_subcompositor, es->w_surface2, es->w_surface);
-	wl_subsurface_place_below(es->w_subsurface2, es->w_surface);
+	wl_subsurface_set_position(es->w_subsurface2, -20, -20);
+	wl_subsurface_place_above(es->w_subsurface2, es->w_surface);
 	wl_subsurface_set_sync(es->w_subsurface2);
 
 	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
+	wl_surface_commit(es->w_surface2);
+
 
 	wl_surface_commit(es->w_surface);
 
@@ -1377,8 +1404,12 @@ wayland_out_new(const bool is_egl)
 
 struct egl_wayland_out_env* egl_wayland_out_new(void)
 {
+	return wayland_out_new(true);
+}
+
+struct egl_wayland_out_env* dmabuf_wayland_out_new(void)
+{
 	return wayland_out_new(false);
-//	return wayland_out_new(true);
 }
 
 void egl_wayland_out_delete(struct egl_wayland_out_env *de)
