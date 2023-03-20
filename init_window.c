@@ -45,6 +45,8 @@
 
 #define ES_SIG 0x12345678
 
+#define W_SUBSURFACE 0
+
 struct wl_egl_window *egl_window;
 struct wl_region *region;
 
@@ -57,6 +59,8 @@ struct _escontext
 	struct wl_display *native_display;
 	int window_width;
 	int window_height;
+	int req_w;
+	int req_h;
 	struct wl_egl_window *native_window;
 	struct wl_compositor *w_compositor;
 	struct wl_surface *w_surface;
@@ -65,12 +69,12 @@ struct _escontext
 	struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1_bind;
 	struct wl_shm *w_shm;
 	struct wl_subcompositor *w_subcompositor;
-    struct zxdg_decoration_manager_v1 *x_decoration;
+	struct zxdg_decoration_manager_v1 *x_decoration;
 	EGLDisplay display;
 	EGLContext context;
 	EGLSurface surface;
 
-    unsigned int sig;
+	unsigned int sig;
 };
 
 struct _escontext ESContext = {
@@ -81,7 +85,7 @@ struct _escontext ESContext = {
 	.display = NULL,
 	.context = NULL,
 	.surface = NULL,
-    .sig = ES_SIG
+	.sig = ES_SIG
 };
 
 typedef struct egl_aux_s
@@ -94,7 +98,7 @@ struct egl_wayland_out_env
 {
 	struct _escontext * es;
 
-    enum AVPixelFormat avfmt;
+	enum AVPixelFormat avfmt;
 
 	int show_all;
 	int window_width, window_height;
@@ -121,107 +125,105 @@ struct egl_wayland_out_env
 #define WINDOW_HEIGHT 720
 
 bool program_alive;
-int32_t old_w, old_h;
-
 
 
 /* Shared memory support code */
 static void
 randname(char *buf)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long r = ts.tv_nsec;
-    for (int i = 0; i < 6; ++i) {
-        buf[i] = 'A'+(r&15)+(r&16)*2;
-        r >>= 5;
-    }
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	long r = ts.tv_nsec;
+	for (int i = 0; i < 6; ++i) {
+		buf[i] = 'A'+(r&15)+(r&16)*2;
+		r >>= 5;
+	}
 }
 
 static int
 create_shm_file(void)
 {
-    int retries = 100;
-    do {
-        char name[] = "/wl_shm-XXXXXX";
-        randname(name + sizeof(name) - 7);
-        --retries;
-        int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd >= 0) {
-            shm_unlink(name);
-            return fd;
-        }
-    } while (retries > 0 && errno == EEXIST);
-    return -1;
+	int retries = 100;
+	do {
+		char name[] = "/wl_shm-XXXXXX";
+		randname(name + sizeof(name) - 7);
+		--retries;
+		int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0) {
+			shm_unlink(name);
+			return fd;
+		}
+	} while (retries > 0 && errno == EEXIST);
+	return -1;
 }
 
 static int
 allocate_shm_file(size_t size)
 {
-    int fd = create_shm_file();
-    if (fd < 0)
-        return -1;
-    int ret;
-    do {
-        ret = ftruncate(fd, size);
-    } while (ret < 0 && errno == EINTR);
-    if (ret < 0) {
-        close(fd);
-        return -1;
-    }
-    return fd;
+	int fd = create_shm_file();
+	if (fd < 0)
+		return -1;
+	int ret;
+	do {
+		ret = ftruncate(fd, size);
+	} while (ret < 0 && errno == EINTR);
+	if (ret < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 static void
 shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
 	(void)data;
-    /* Sent by the compositor when it's no longer using this buffer */
-    wl_buffer_destroy(wl_buffer);
+	/* Sent by the compositor when it's no longer using this buffer */
+	wl_buffer_destroy(wl_buffer);
 }
 
 static const struct wl_buffer_listener shm_buffer_listener = {
-    .release = shm_buffer_release,
+	.release = shm_buffer_release,
 };
 
 static struct wl_buffer *
 draw_frame(struct _escontext * const es)
 {
-    const int width = 640, height = 480;
-    int stride = width * 4;
-    int size = stride * height;
+	const int width = 640, height = 480;
+	int stride = width * 4;
+	int size = stride * height;
 
-    int fd = allocate_shm_file(size);
-    if (fd == -1) {
-        return NULL;
-    }
+	int fd = allocate_shm_file(size);
+	if (fd == -1) {
+		return NULL;
+	}
 
-    uint32_t *data = mmap(NULL, size,
-            PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        close(fd);
-        return NULL;
-    }
+	uint32_t *data = mmap(NULL, size,
+			PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		close(fd);
+		return NULL;
+	}
 
-    struct wl_shm_pool *pool = wl_shm_create_pool(es->w_shm, fd, size);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
-            width, height, stride, WL_SHM_FORMAT_XRGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
+	struct wl_shm_pool *pool = wl_shm_create_pool(es->w_shm, fd, size);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
+			width, height, stride, WL_SHM_FORMAT_XRGB8888);
+	wl_shm_pool_destroy(pool);
+	close(fd);
 
-    /* Draw checkerboxed background */
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            if ((x + y / 8 * 8) % 16 < 8)
-                data[y * width + x] = 0xFF666666;
-            else
-                data[y * width + x] = 0xFFEEEEEE;
-        }
-    }
+	/* Draw checkerboxed background */
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			if ((x + y / 8 * 8) % 16 < 8)
+				data[y * width + x] = 0xFF666666;
+			else
+				data[y * width + x] = 0xFFEEEEEE;
+		}
+	}
 
-    munmap(data, size);
-    wl_buffer_add_listener(buffer, &shm_buffer_listener, NULL);
-    return buffer;
+	munmap(data, size);
+	wl_buffer_add_listener(buffer, &shm_buffer_listener, NULL);
+	return buffer;
 }
 
 
@@ -308,15 +310,15 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 
 	wl_buffer_add_listener(new_buffer, &w_buffer_listener, dbe);
 
-    // *************
-    assert(es->sig == ES_SIG);
-    if (0)
-    {
+	// *************
+	assert(es->sig == ES_SIG);
+	if (0)
+	{
 	wl_buffer_destroy(new_buffer);
 	dmabuf_w_env_delete(dbe);
-    new_buffer = draw_frame(es);
-    }
-    // *************
+	new_buffer = draw_frame(es);
+	}
+	// *************
 
 //	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
 //	wl_surface_damage(es->w_surface2, 0, 0, INT32_MAX, INT32_MAX);
@@ -381,8 +383,8 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 			const AVDRMObjectDescriptor *const obj = desc->objects + p->object_index;
 
 			zwp_linux_buffer_params_v1_add(params, obj->fd, n++, p->offset, p->pitch,
-						       (unsigned int)(obj->format_modifier >> 32),
-						       (unsigned int)(obj->format_modifier & 0xFFFFFFFF));
+							   (unsigned int)(obj->format_modifier >> 32),
+							   (unsigned int)(obj->format_modifier & 0xFFFFFFFF));
 		}
 	}
 
@@ -393,9 +395,9 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 			flags |= ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_BOTTOM_FIRST;
 	}
 
-    assert(es->sig == ES_SIG);
+	assert(es->sig == ES_SIG);
 
-    /* Request buffer creation */
+	/* Request buffer creation */
 	zwp_linux_buffer_params_v1_add_listener(params, &params_wl_dmabuf_listener,
 		dmabuf_w_env_new(es, frame->buf[0]));
 
@@ -468,6 +470,13 @@ static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const 
 				return -1;
 			}
 		}
+	}
+
+	if (es->req_w != es->window_width || es->req_h != es->window_height) {
+		LOG("%s: Resize %dx%d -> %dx%d\n", __func__, es->window_width, es->window_height, es->req_w, es->req_h);
+		wl_egl_window_resize(es->native_window, es->req_w, es->req_h, 0, 0);
+		es->window_width = es->req_w;
+		es->window_height = es->req_h;
 	}
 
 	for (i = 0; i != 32; ++i)
@@ -879,21 +888,20 @@ static void xdg_toplevel_handle_configure(void *data,
 {
 	struct _escontext * const es = data;
 	(void)xdg_toplevel;
-	(void)states;
+	uint32_t * p;
+
+	LOG("%s: %dx%d\n", __func__, w, h);
+
+	wl_array_for_each(p, states) {
+		LOG("  [] %"PRId32"\n", *p);
+	}
 
 	// no window geometry event, ignore
 	if (w == 0 && h == 0)
 		return;
 
-	// window resized
-	if (old_w != w && old_h != h)
-	{
-		old_w = w;
-		old_h = h;
-
-		wl_egl_window_resize(es->native_window, w, h, 0, 0);
-		wl_surface_commit(es->w_surface);
-	}
+	es->req_h = h;
+	es->req_w = w;
 }
 
 static void xdg_toplevel_handle_close(void *data,
@@ -906,16 +914,67 @@ static void xdg_toplevel_handle_close(void *data,
 	program_alive = false;
 }
 
-struct xdg_toplevel_listener xdg_toplevel_listener = {
+static void
+xdg_toplevel_configure_bounds_cb(void *data,
+			 struct xdg_toplevel *xdg_toplevel,
+			 int32_t width,
+			 int32_t height)
+{
+	(void)data;
+	LOG("%s[%p]: %dx%d\n", __func__, (void*)xdg_toplevel, width, height);
+}
+
+/**
+ * compositor capabilities
+ *
+ * This event advertises the capabilities supported by the
+ * compositor. If a capability isn't supported, clients should hide
+ * or disable the UI elements that expose this functionality. For
+ * instance, if the compositor doesn't advertise support for
+ * minimized toplevels, a button triggering the set_minimized
+ * request should not be displayed.
+ *
+ * The compositor will ignore requests it doesn't support. For
+ * instance, a compositor which doesn't advertise support for
+ * minimized will ignore set_minimized requests.
+ *
+ * Compositors must send this event once before the first
+ * xdg_surface.configure event. When the capabilities change,
+ * compositors must send this event again and then send an
+ * xdg_surface.configure event.
+ *
+ * The configured state should not be applied immediately. See
+ * xdg_surface.configure for details.
+ *
+ * The capabilities are sent as an array of 32-bit unsigned
+ * integers in native endianness.
+ * @param capabilities array of 32-bit capabilities
+ * @since 5
+ */
+static void xdg_toplevel_wm_capabilities_cb(void *data,
+			struct xdg_toplevel *xdg_toplevel,
+			struct wl_array *capabilities)
+{
+	(void)data;
+	LOG("%s[%p]:\n", __func__, (void*)xdg_toplevel);
+	for (size_t i = 0; i != capabilities->size / 4; ++i) {
+		uint32_t cap = ((const uint32_t *)capabilities->data)[i];
+		LOG("  [%zd]: %"PRId32"\n", i, cap);
+	}
+}
+
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
 	.configure = xdg_toplevel_handle_configure,
 	.close = xdg_toplevel_handle_close,
+	.configure_bounds = xdg_toplevel_configure_bounds_cb,
+	.wm_capabilities = xdg_toplevel_wm_capabilities_cb,
 };
 
 
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
 								  uint32_t serial)
 {
-    struct egl_wayland_out_env * const de = data;
+	struct egl_wayland_out_env * const de = data;
 //	struct _escontext *const es = de->es;
 	LOG("%s\n", __func__);
 	// confirm that you exist to the compositor
@@ -945,21 +1004,18 @@ const struct xdg_wm_base_listener xdg_wm_base_listener = {
 	.ping = xdg_wm_base_ping,
 };
 
-void CreateNativeWindow(struct _escontext * const es, char *title, int width, int height)
+void CreateNativeWindow(struct _escontext * const es, char *title)
 {
 	(void)title;
 
-	old_w = WINDOW_WIDTH;
-	old_h = WINDOW_HEIGHT;
-
 	region = wl_compositor_create_region(es->w_compositor);
 
-	wl_region_add(region, 0, 0, width, height);
+	wl_region_add(region, 0, 0, es->req_w, es->req_h);
 	wl_surface_set_opaque_region(es->w_surface, region);
 
-	es->window_width = width;
-	es->window_height = height;
-
+	LOG("%s: %dx%d\n", __func__, es->req_w, es->req_h);
+	es->window_width = es->req_w;
+	es->window_height = es->req_h;
 }
 
 EGLBoolean CreateEGLContext(struct _escontext * const es)
@@ -974,9 +1030,9 @@ EGLBoolean CreateEGLContext(struct _escontext * const es)
 	{
 		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-		EGL_RED_SIZE,        8,
-		EGL_GREEN_SIZE,      8,
-		EGL_BLUE_SIZE,       8,
+		EGL_RED_SIZE,   	 8,
+		EGL_GREEN_SIZE, 	 8,
+		EGL_BLUE_SIZE,  	 8,
 		EGL_NONE
 	};
 	EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE, EGL_NONE };
@@ -1046,15 +1102,15 @@ EGLBoolean CreateEGLContext(struct _escontext * const es)
 	return EGL_TRUE;
 }
 
-static EGLBoolean CreateWindowWithEGLContext(struct _escontext * const es, char *title, int width, int height)
+static EGLBoolean CreateWindowWithEGLContext(struct _escontext * const es, char *title)
 {
-	CreateNativeWindow(es, title, width, height);
+	CreateNativeWindow(es, title);
 	return CreateEGLContext(es);
 }
 
-static void CreateWindowForDmaBuf(struct _escontext * const es, char *title, int width, int height)
+static void CreateWindowForDmaBuf(struct _escontext * const es, char *title)
 {
-	CreateNativeWindow(es, title, width, height);
+	CreateNativeWindow(es, title);
 }
 
 unsigned long last_click = 0;
@@ -1064,8 +1120,8 @@ void RefreshWindow()
 }
 
 static void linux_dmabuf_v1_listener_format(void *data,
-		       struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
-		       uint32_t format)
+			   struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
+			   uint32_t format)
 {
 	// Superceeded by _modifier
 	struct _escontext * const es = data;
@@ -1097,13 +1153,13 @@ decoration_configure(void *data,
 			  struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1,
 			  uint32_t mode)
 {
-    (void)data;
-    printf("%s[%p]: mode %d\n", __func__, (void*)zxdg_toplevel_decoration_v1, mode);
-    zxdg_toplevel_decoration_v1_destroy(zxdg_toplevel_decoration_v1);
+	(void)data;
+	printf("%s[%p]: mode %d\n", __func__, (void*)zxdg_toplevel_decoration_v1, mode);
+	zxdg_toplevel_decoration_v1_destroy(zxdg_toplevel_decoration_v1);
 }
 
 static struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
-    .configure = decoration_configure,
+	.configure = decoration_configure,
 };
 
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id,
@@ -1129,7 +1185,7 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 		xdg_wm_base_add_listener(XDGWMBase, &xdg_wm_base_listener, NULL);
 	}
 	if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
-        es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
+		es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
 }
 
 static void global_registry_remover(void *data, struct wl_registry *registry, uint32_t id)
@@ -1316,10 +1372,13 @@ wayland_out_new(const bool is_egl)
 
 	LOG("<<< %s\n", __func__);
 
-    de->es = es;
+	de->es = es;
 	de->prod_fd = -1;
 	de->q_terminate = 0;
 	de->is_egl = is_egl;
+
+	es->req_w = WINDOW_WIDTH;
+	es->req_h = WINDOW_HEIGHT;
 
 	pthread_mutex_init(&de->q_lock, NULL);
 	sem_init(&de->display_start_sem, 0, 0);
@@ -1340,16 +1399,19 @@ wayland_out_new(const bool is_egl)
 	xdg_surface_add_listener(XDGSurface, &xdg_surface_listener, de);
 
 	XDGToplevel = xdg_surface_get_toplevel(XDGSurface);
-	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
 	xdg_toplevel_add_listener(XDGToplevel, &xdg_toplevel_listener, es);
 
-    {
-        struct zxdg_toplevel_decoration_v1 * const decobj =
-            zxdg_decoration_manager_v1_get_toplevel_decoration(es->x_decoration, XDGToplevel);
-        zxdg_toplevel_decoration_v1_set_mode(decobj, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-        zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
-    }
+	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
+	xdg_toplevel_set_fullscreen(XDGToplevel, NULL);
 
+	{
+		struct zxdg_toplevel_decoration_v1 * const decobj =
+			zxdg_decoration_manager_v1_get_toplevel_decoration(es->x_decoration, XDGToplevel);
+		zxdg_toplevel_decoration_v1_set_mode(decobj, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
+	}
+
+#if W_SUBSURFACE
 	es->w_surface2 = wl_compositor_create_surface(es->w_compositor);
 	es->w_subsurface2 = wl_subcompositor_get_subsurface(es->w_subcompositor, es->w_surface2, es->w_surface);
 	wl_subsurface_set_position(es->w_subsurface2, -20, -20);
@@ -1358,23 +1420,29 @@ wayland_out_new(const bool is_egl)
 
 	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
 	wl_surface_commit(es->w_surface2);
-
+#endif
 
 	wl_surface_commit(es->w_surface);
+
+	// This call the attached listener global_registry_handler
+	wl_display_dispatch(es->native_display);
+	wl_display_roundtrip(es->native_display);
+
+	LOG("--- post round 2--\n");
 
 // *****
 
 //	while (wl_display_dispatch(es->native_display))
 //	{
-//	    /* This space deliberately left blank */
+//  	/* This space deliberately left blank */
 //	}
 
 // *****
 
 	if (is_egl)
-		CreateWindowWithEGLContext(es, "Nya", 1280, 720);
+		CreateWindowWithEGLContext(es, "Nya");
 	else
-		CreateWindowForDmaBuf(es, "Dma", 1920, 1080);
+		CreateWindowForDmaBuf(es, "Dma");
 
 	LOG("<<< %s\n", __func__);
 
@@ -1424,9 +1492,9 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 	de->q_terminate = 1;
 	display_prod(de);
 	pthread_join(de->q_thread, NULL);
-    if (de->prod_fd != -1)
-        close(de->prod_fd);
-    pthread_mutex_destroy(&de->q_lock);
+	if (de->prod_fd != -1)
+		close(de->prod_fd);
+	pthread_mutex_destroy(&de->q_lock);
 
 	av_frame_free(&de->q_next);
 	av_frame_free(&de->q_this);
