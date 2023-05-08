@@ -300,9 +300,11 @@ us_time()
 void usage()
 {
     fprintf(stderr,
-            "Usage: hello_egl_wayland [-l loop_count] [-f <frames>] [-o yuv_output_file]\n"
+            "Usage: hello_egl_wayland [-d]\n"
+            "                      [-l loop_count] [-f <frames>] [-o yuv_output_file]\n"
             "                      [--deinterlace] [--pace-input <hz>]\n"
-            "                      <input file> [<input_file> ...]\n");
+            "                      <input file> [<input_file> ...]\n"
+            " -d   Use dmabuf (otherwise egl)\n");
     exit(1);
 }
 
@@ -460,7 +462,7 @@ loopy:
         }
         hw_pix_fmt = AV_PIX_FMT_DRM_PRIME;
     }
-#if 1
+#if 0
     else if (decoder->id == AV_CODEC_ID_HEVC) {
         if ((decoder = avcodec_find_decoder_by_name("hevc_v4l2m2m")) == NULL) {
             fprintf(stderr, "Cannot find the hevc v4l2m2m decoder\n");

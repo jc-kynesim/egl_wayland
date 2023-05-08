@@ -5,6 +5,7 @@
 #include <wayland-client-protocol.h>
 #include <wayland-egl.h> // Wayland EGL MUST be included before EGL headers
 
+#include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
@@ -70,6 +71,8 @@ struct _escontext
 	struct wl_shm *w_shm;
 	struct wl_subcompositor *w_subcompositor;
 	struct zxdg_decoration_manager_v1 *x_decoration;
+	struct wp_viewporter *w_viewporter;
+	struct wp_viewport *w_viewport;
 	EGLDisplay display;
 	EGLContext context;
 	EGLSurface surface;
@@ -304,7 +307,7 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 	g_cond_signal(&d->cond);
 	g_mutex_unlock(&d->lock);
 #endif
-	printf("%s: ok data=%p, buf=%p, es=%p\n", __func__, data, (void*)buf, (void*)es);
+	printf("%s: ok data=%p, buf=%p, es=%p, %dx%d\n", __func__, data, (void*)buf, (void*)es, es->req_w, es->req_h);
 	fflush(stdout);
 	zwp_linux_buffer_params_v1_destroy(params);
 
@@ -325,6 +328,7 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 //    wl_surface_commit(es->w_surface2);
 
 	wl_surface_attach(es->w_surface, new_buffer, 0, 0);
+	wp_viewport_set_destination(es->w_viewport, es->req_w, es->req_h);
 	wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
 	wl_surface_commit(es->w_surface);
 }
@@ -1186,6 +1190,8 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 	}
 	if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
 		es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
+	if (strcmp(interface, wp_viewporter_interface.name) == 0)
+		es->w_viewporter = wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
 }
 
 static void global_registry_remover(void *data, struct wl_registry *registry, uint32_t id)
@@ -1394,6 +1400,7 @@ wayland_out_new(const bool is_egl)
 	else
 		LOG("Got a compositor surface !\n");
 
+	es->w_viewport = wp_viewporter_get_viewport(es->w_viewporter, es->w_surface);
 	XDGSurface = xdg_wm_base_get_xdg_surface(XDGWMBase, es->w_surface);
 
 	xdg_surface_add_listener(XDGSurface, &xdg_surface_listener, de);
@@ -1404,7 +1411,10 @@ wayland_out_new(const bool is_egl)
 	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
 	xdg_toplevel_set_fullscreen(XDGToplevel, NULL);
 
-	{
+	if (!es->x_decoration) {
+		LOG("No decoration manager\n");
+	}
+	else {
 		struct zxdg_toplevel_decoration_v1 * const decobj =
 			zxdg_decoration_manager_v1_get_toplevel_decoration(es->x_decoration, XDGToplevel);
 		zxdg_toplevel_decoration_v1_set_mode(decobj, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
