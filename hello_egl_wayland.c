@@ -302,7 +302,7 @@ void usage()
     fprintf(stderr,
             "Usage: hello_egl_wayland [-d]\n"
             "                      [-l loop_count] [-f <frames>] [-o yuv_output_file]\n"
-            "                      [--deinterlace] [--pace-input <hz>]\n"
+            "                      [--deinterlace] [--pace-input <hz>] [--fullscreen]\n"
             "                      <input file> [<input_file> ...]\n"
             " -d   Use dmabuf (otherwise egl)\n");
     exit(1);
@@ -334,6 +334,7 @@ int main(int argc, char *argv[])
     bool wants_deinterlace = false;
     long pace_input_hz = 0;
     bool use_dmabuf = false;
+    bool fullscreen = false;
 
     {
         char * const * a = argv + 1;
@@ -360,6 +361,9 @@ int main(int argc, char *argv[])
                     usage();
                 --n;
                 ++a;
+            }
+            else if (strcmp(arg, "-F") == 0 || strcmp(arg, "--fullscreen") == 0) {
+                fullscreen = true;
             }
             else if (strcmp(arg, "-o") == 0) {
                 if (n == 0)
@@ -417,7 +421,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    dpo = use_dmabuf ? dmabuf_wayland_out_new() : egl_wayland_out_new();
+    dpo = use_dmabuf ? dmabuf_wayland_out_new(fullscreen) : egl_wayland_out_new(fullscreen);
     if (dpo == NULL) {
         fprintf(stderr, "Failed to open egl_wayland output\n");
         return 1;

@@ -1370,7 +1370,7 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 
 
 static struct egl_wayland_out_env*
-wayland_out_new(const bool is_egl)
+wayland_out_new(const bool is_egl, const bool fullscreen)
 {
 	struct egl_wayland_out_env *de = calloc(1, sizeof(*de));
 	unsigned int i;
@@ -1409,7 +1409,8 @@ wayland_out_new(const bool is_egl)
 	xdg_toplevel_add_listener(XDGToplevel, &xdg_toplevel_listener, es);
 
 	xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
-	xdg_toplevel_set_fullscreen(XDGToplevel, NULL);
+	if (fullscreen)
+		xdg_toplevel_set_fullscreen(XDGToplevel, NULL);
 
 	if (!es->x_decoration) {
 		LOG("No decoration manager\n");
@@ -1480,14 +1481,14 @@ wayland_out_new(const bool is_egl)
 	return de;
 }
 
-struct egl_wayland_out_env* egl_wayland_out_new(void)
+struct egl_wayland_out_env* egl_wayland_out_new(bool fullscreen)
 {
-	return wayland_out_new(true);
+	return wayland_out_new(true, fullscreen);
 }
 
-struct egl_wayland_out_env* dmabuf_wayland_out_new(void)
+struct egl_wayland_out_env* dmabuf_wayland_out_new(bool fullscreen)
 {
-	return wayland_out_new(false);
+	return wayland_out_new(false, fullscreen);
 }
 
 void egl_wayland_out_delete(struct egl_wayland_out_env *de)
