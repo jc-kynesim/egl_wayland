@@ -1174,7 +1174,7 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 
 	LOG("Got a registry event for %s id %d\n", interface, id);
 	if (strcmp(interface, wl_compositor_interface.name) == 0)
-		es->w_compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 1);
+		es->w_compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
 	if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
 		es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 1);
 		zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1_bind, &linux_dmabuf_v1_listener, es);
