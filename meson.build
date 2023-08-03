@@ -66,3 +66,13 @@ executable('hello_egl_wayland',
     dependency('libavutil'),
   ]
 )
+
+executable('dtest',
+  ['dtest.c', 'dmabuf_alloc.c'] + protocols_files,
+  install : true,
+  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
+    threads_dep,
+    dep_rt,
+  ]
+)
+

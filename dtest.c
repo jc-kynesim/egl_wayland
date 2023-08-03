@@ -11,6 +11,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
 #include "init_window.h"
+#include "dmabuf_alloc.h"
 //#include "log.h"
 #define LOG printf
 
@@ -33,16 +34,23 @@
 #include <epoxy/gl.h>
 #include <epoxy/egl.h>
 
+#include <libdrm/drm_fourcc.h>
+
 #include <pthread.h>
 #include <semaphore.h>
 
-#include "libavutil/frame.h"
-#include "libavcodec/avcodec.h"
-#include "libavutil/hwcontext.h"
-#include "libavutil/hwcontext_drm.h"
-
 #define TRACE_ALL 1
 #define  DEBUG_SOLID 0
+
+#define DBCOUNT 32
+#define BUF_W 1920
+#define BUF_STRIDE ((BUF_W + 127) & ~127)
+#define BUF_H 1080
+#define BUF_STRIDE2 (BUF_H * 3/2)
+#define BUFSIZE (BUF_STRIDE * BUF_STRIDE2)
+#define BAR_Y 0xff
+#define BKG_Y 0
+
 
 #define ES_SIG 0x12345678
 
@@ -98,32 +106,39 @@ typedef struct egl_aux_s
 } egl_aux_t;
 
 
+#define THING_Q_LEN 128
+typedef struct thing_q_ss {
+	pthread_mutex_t lock;
+	unsigned int p_in;
+	unsigned int p_out;
+	void * q[THING_Q_LEN];
+} thing_q;
+
+
 #define FQLEN 128
 
 struct egl_wayland_out_env
 {
 	struct _escontext * es;
 
-	enum AVPixelFormat avfmt;
-
 	int show_all;
 	int window_width, window_height;
 	int window_x, window_y;
 	int fullscreen;
 
+	uint64_t last_display;
+
 	egl_aux_t aux[32];
 
 	pthread_t q_thread;
-	pthread_mutex_t q_lock;
 	sem_t display_start_sem;
-	sem_t q_sem;
+	sem_t free_sem;
 	int prod_fd;
 	int q_terminate;
 	bool is_egl;
 
-	AVFrame * frame_q[FQLEN];
-	unsigned int fq_in;
-	unsigned int fq_out;
+	thing_q q_in;
+	thing_q q_out;
 };
 
 #define TRUE 1
@@ -134,6 +149,32 @@ struct egl_wayland_out_env
 
 bool program_alive;
 
+
+static inline char drmu_log_safechar(int c)
+{
+    return (c < ' ' || c >=0x7f) ? '?' : c;
+}
+
+static inline const char * drmu_log_fourcc_to_str(char buf[5], uint32_t fcc)
+{
+    if (fcc == 0)
+        return "----";
+    buf[0] = drmu_log_safechar((fcc >> 0) & 0xff);
+    buf[1] = drmu_log_safechar((fcc >> 8) & 0xff);
+    buf[2] = drmu_log_safechar((fcc >> 16) & 0xff);
+    buf[3] = drmu_log_safechar((fcc >> 24) & 0xff);
+    buf[4] = 0;
+    return buf;
+}
+
+#define drmu_log_fourcc(fcc) drmu_log_fourcc_to_str((char[5]){0}, fcc)
+
+static uint64_t us_time()
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (ts.tv_nsec / 1000) + ((uint64_t)ts.tv_sec * 1000000);
+}
 
 /* Shared memory support code */
 static void
@@ -194,6 +235,47 @@ static const struct wl_buffer_listener shm_buffer_listener = {
 	.release = shm_buffer_release,
 };
 
+static void
+q_thing(thing_q * const tq, void * const v)
+{
+	pthread_mutex_lock(&tq->lock);
+	tq->q[tq->p_in] = v;
+	tq->p_in = (tq->p_in + 1) & (THING_Q_LEN - 1);
+	assert(tq->p_in != tq->p_out);
+	pthread_mutex_unlock(&tq->lock);
+}
+
+static void *
+dq_thing(thing_q * const tq)
+{
+	void * rv = NULL;
+
+	pthread_mutex_lock(&tq->lock);
+	if (tq->p_in != tq->p_out) {
+		rv = tq->q[tq->p_out];
+		tq->q[tq->p_out] = NULL;
+		tq->p_out = (tq->p_out + 1) & (THING_Q_LEN - 1);
+	}
+	pthread_mutex_unlock(&tq->lock);
+
+	return rv;
+}
+
+static void
+thing_q_init(thing_q * const tq)
+{
+	memset(tq, 0, sizeof(tq));
+	pthread_mutex_init(&tq->lock, NULL);
+}
+
+static void
+thing_q_uninit(thing_q * const tq)
+{
+	pthread_mutex_destroy(&tq->lock);
+}
+
+
+
 static struct wl_buffer *
 draw_frame(struct _escontext * const es)
 {
@@ -234,52 +316,27 @@ draw_frame(struct _escontext * const es)
 	return buffer;
 }
 
-
-
-
-static int
-check_support(const struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
-{
-	EGLuint64KHR mods[16];
-	GLint mod_count = 0;
-	GLint i;
-
-	if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
-	{
-		LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
-		return 0;
-	}
-
-	for (i = 0; i < mod_count; ++i)
-	{
-		if (mods[i] == mod)
-			return 1;
-	}
-
-	LOG("Failed to find modifier %"PRIx64"\n", mod);
-	return 0;
-}
-
 struct dmabuf_w_env_s {
-	AVBufferRef * buf;
-	struct _escontext * es;
+	struct dmabuf_h * buf;
+	struct egl_wayland_out_env * de;
 };
 
 static struct dmabuf_w_env_s *
-dmabuf_w_env_new(struct _escontext *const es, AVBufferRef * const buf)
+dmabuf_w_env_new(struct egl_wayland_out_env *const de, struct dmabuf_h *const buf)
 {
 	struct dmabuf_w_env_s * const dbe = malloc(sizeof(*dbe));
 	if (!dbe)
 		return NULL;
-	dbe->buf = av_buffer_ref(buf);
-	dbe->es = es;
+	dbe->buf = buf;
+	dbe->de = de;
 	return dbe;
 }
 
 static void
 dmabuf_w_env_delete(struct dmabuf_w_env_s * const dbe)
 {
-	av_buffer_unref(&dbe->buf);
+	q_thing(&dbe->de->q_out, dbe->buf);
+	sem_post(&dbe->de->free_sem);
 	free(dbe);
 }
 
@@ -302,8 +359,8 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 		 struct wl_buffer *new_buffer)
 {
 	struct dmabuf_w_env_s * const dbe = data;
-	struct _escontext * const es = dbe->es;
-	AVBufferRef * buf = dbe->buf;
+	struct _escontext * const es = dbe->de->es;
+	struct dmabuf_h * buf = dbe->buf;
 #if 0
 	ConstructBufferData *d = data;
 
@@ -362,16 +419,14 @@ static const struct zwp_linux_buffer_params_v1_listener params_wl_dmabuf_listene
 };
 
 static struct wl_buffer*
-do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
+do_display_dmabuf(egl_wayland_out_env_t *const de, struct dmabuf_h * const buf)
 {
+	struct _escontext *const es = de->es;
 	struct zwp_linux_buffer_params_v1 *params;
-	const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
-	const uint32_t format = desc->layers[0].format;
-	const unsigned int width = av_frame_cropped_width(frame);
-	const unsigned int height = av_frame_cropped_height(frame);
-	unsigned int n = 0;
-	unsigned int flags = 0;
-	int i;
+	const uint32_t format = DRM_FORMAT_NV12;
+	const unsigned int width = BUF_W;
+	const unsigned int height = BUF_H;
+	const uint64_t mod = DRM_FORMAT_MOD_BROADCOM_SAND128_COL_HEIGHT(BUF_STRIDE2);
 
 	LOG("<<< %s\n", __func__);
 
@@ -383,34 +438,20 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 		return NULL;
 	}
 
-	for (i = 0; i < desc->nb_layers; ++i)
-	{
-		int j;
-		for (j = 0; j < desc->layers[i].nb_planes; ++j)
-		{
-			const AVDRMPlaneDescriptor *const p = desc->layers[i].planes + j;
-			const AVDRMObjectDescriptor *const obj = desc->objects + p->object_index;
-
-			zwp_linux_buffer_params_v1_add(params, obj->fd, n++, p->offset, p->pitch,
-							   (unsigned int)(obj->format_modifier >> 32),
-							   (unsigned int)(obj->format_modifier & 0xFFFFFFFF));
-		}
-	}
-
-	if (frame->interlaced_frame)
-	{
-		flags |= ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_INTERLACED;
-		if (!frame->top_field_first)
-			flags |= ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_BOTTOM_FIRST;
-	}
+	zwp_linux_buffer_params_v1_add(params, dmabuf_fd(buf), 0, 0, BUF_STRIDE,
+								   (unsigned int)(mod >> 32), (unsigned int)(mod & 0xFFFFFFFF));
+	zwp_linux_buffer_params_v1_add(params, dmabuf_fd(buf), 1, BUF_H * 128, BUF_STRIDE,
+								   (unsigned int)(mod >> 32), (unsigned int)(mod & 0xFFFFFFFF));
 
 	assert(es->sig == ES_SIG);
 
 	/* Request buffer creation */
 	zwp_linux_buffer_params_v1_add_listener(params, &params_wl_dmabuf_listener,
-		dmabuf_w_env_new(es, frame->buf[0]));
+		dmabuf_w_env_new(de, buf));
 
-	zwp_linux_buffer_params_v1_create(params, width, height, format, flags);
+	zwp_linux_buffer_params_v1_create(params, width, height, format, 0);
+
+	wl_display_flush(es->native_display);
 
 #if 0
 	/* Wait for the request answer */
@@ -443,8 +484,12 @@ out:
 	return NULL;
 }
 
-static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const es, AVFrame *const frame)
+static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const es, struct dmabuf_h * const buf)
 {
+	(void)de;
+	(void)es;
+	(void)buf;
+#if 0
 #if DEBUG_SOLID
 	(void)de;
 	(void)frame;
@@ -627,6 +672,7 @@ static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const 
 	da->texture = 0;
 	da->fd = -1;
 #endif
+#endif
 	return 0;
 }
 
@@ -753,37 +799,7 @@ gl_setup()
 	return 0;
 }
 
-static void
-q_frame(struct egl_wayland_out_env * const de, AVFrame ** const pframe)
-{
-	pthread_mutex_lock(&de->q_lock);
-	de->frame_q[de->fq_in] = *pframe;
-	if (++de->fq_in >= FQLEN)
-		de->fq_in = 0;
-	assert(de->fq_in != de->fq_out);
-	*pframe = NULL;
-	pthread_mutex_unlock(&de->q_lock);
-	printf("Frame Q %d\n", de->fq_in - de->fq_out);
-}
-
-static AVFrame *
-dq_frame(struct egl_wayland_out_env * const de)
-{
-	AVFrame * frame = NULL;
-
-	pthread_mutex_lock(&de->q_lock);
-	if (de->fq_out != de->fq_in)
-	{
-		frame = de->frame_q[de->fq_out];
-		de->frame_q[de->fq_out] = NULL;
-		if (++de->fq_out >= FQLEN)
-			de->fq_out = 0;
-	}
-	pthread_mutex_unlock(&de->q_lock);
-
-	return frame;
-}
-
+#define PACE_TIME 15000
 
 static void* display_thread(void *v)
 {
@@ -833,7 +849,7 @@ static void* display_thread(void *v)
 			LOG("DmaBuf formats found=%d\n", fcount);
 			for (i = 0; i != fcount; ++i)
 			{
-				LOG("[%d] %s\n", i, av_fourcc2str(fmts[i]));
+				LOG("[%d] %s\n", i, drmu_log_fourcc(fmts[i]));
 			}
 		}
 	}
@@ -845,8 +861,8 @@ static void* display_thread(void *v)
 
 	while (!de->q_terminate)
 	{
-		AVFrame *frame;
 		int rv;
+		uint64_t now;
 
 		for(;;) {
 			wl_display_dispatch_pending(es->native_display);
@@ -866,8 +882,9 @@ static void* display_thread(void *v)
 		pollfds[0] = (struct pollfd){.fd = de->prod_fd, .events = POLLIN};
 		pollfds[1] = (struct pollfd){.fd = wl_fd, .events = wl_poll_out ? POLLIN | POLLOUT : POLLIN};
 
+justpoll:
 		do {
-			rv = poll(pollfds, 2, -1);
+			rv = poll(pollfds, 2, 10);
 		} while (rv < 0 && errno == EINTR);
 
 		if (rv < 0)
@@ -875,32 +892,51 @@ static void* display_thread(void *v)
 			LOG("Poll failed: %s\n", strerror(errno));
 			break;
 		}
-		if (rv == 0)
-		{
-			LOG("Poll unexpected timeout\n");
-			break;
+
+		now = us_time();
+
+		if (now - de->last_display >= PACE_TIME) {
+			struct dmabuf_h * buf;
+
+//			printf("now=%"PRId64", last=%"PRId64", diff=%"PRId64"\n", now, de->last_display, now - de->last_display);
+
+			if (now - de->last_display > 1000000)
+				de->last_display = now;
+			else
+				de->last_display += PACE_TIME;
+
+			buf = dq_thing(&de->q_in);
+
+			if (buf)
+			{
+				if (de->is_egl)
+					do_display(de, es, buf);
+				else
+					do_display_dmabuf(de, buf);
+			}
 		}
 
-		if (wl_display_read_events(es->native_display) != 0)
-			LOG("Read Event Failed\n");
+		if (rv == 0)
+		{
+//			LOG("Poll unexpected timeout\n");
+			goto justpoll;
+		}
 
 		if (pollfds[0].revents)
 		{
 			uint64_t rcount = 0;
+
 			if (read(de->prod_fd, &rcount, sizeof(rcount)) != sizeof(rcount))
 				LOG("Unexpected prod read\n");
-
-			frame = dq_frame(de);
-
-			if (frame)
-			{
-				if (de->is_egl)
-					do_display(de, es, frame);
-				else
-					do_display_dmabuf(es, frame);
-				av_frame_free(&frame);
-			}
 		}
+
+		if (pollfds[1].revents)
+		{
+			if (wl_display_read_events(es->native_display) != 0)
+				LOG("Read Event Failed\n");
+		}
+		else
+			goto justpoll;
 	}
 
 #if TRACE_ALL
@@ -1164,7 +1200,7 @@ static void linux_dmabuf_v1_listener_format(void *data,
 	struct _escontext * const es = data;
 	(void)zwp_linux_dmabuf_v1;
 	(void)format;
-	printf("%s[%p], %s\n", __func__, (void*)es, av_fourcc2str(format));
+	printf("%s[%p], %s\n", __func__, (void*)es, drmu_log_fourcc(format));
 }
 
 static void
@@ -1177,7 +1213,7 @@ linux_dmabuf_v1_listener_modifier(void *data,
 	struct _escontext * const es = data;
 	(void)zwp_linux_dmabuf_v1;
 
-	printf("%s[%p], %s %08x%08x\n", __func__, (void*)es, av_fourcc2str(format), modifier_hi, modifier_lo);
+	printf("%s[%p], %s %08x%08x\n", __func__, (void*)es, drmu_log_fourcc(format), modifier_hi, modifier_lo);
 }
 
 static const struct zwp_linux_dmabuf_v1_listener linux_dmabuf_v1_listener = {
@@ -1349,52 +1385,6 @@ display_prod(struct egl_wayland_out_env *de)
 		LOG("Event prod failed!\n");
 }
 
-int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
-{
-	AVFrame *frame = NULL;
-
-#if TRACE_ALL
-	LOG("<<< %s\n", __func__);
-#endif
-
-	if (src_frame->format == AV_PIX_FMT_DRM_PRIME)
-	{
-		frame = av_frame_alloc();
-		av_frame_ref(frame, src_frame);
-	}
-	else if (src_frame->format == AV_PIX_FMT_VAAPI)
-	{
-		frame = av_frame_alloc();
-		frame->format = AV_PIX_FMT_DRM_PRIME;
-		if (av_hwframe_map(frame, src_frame, 0) != 0)
-		{
-			LOG("Failed to map frame (format=%d) to DRM_PRiME\n", src_frame->format);
-			av_frame_free(&frame);
-			return AVERROR(EINVAL);
-		}
-	}
-	else
-	{
-		LOG("Frame (format=%d) not DRM_PRiME\n", src_frame->format);
-		return AVERROR(EINVAL);
-	}
-
-	// Really hacky sync
-	while (de->show_all && de->fq_in != de->fq_out)
-	{
-		usleep(3000);
-	}
-
-	q_frame(de, &frame);
-
-	if (frame == NULL)
-		display_prod(de);
-	else
-		av_frame_free(&frame);
-
-	return 0;
-}
-
 
 static struct egl_wayland_out_env*
 wayland_out_new(const bool is_egl, const bool fullscreen)
@@ -1413,7 +1403,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 	es->req_w = WINDOW_WIDTH;
 	es->req_h = WINDOW_HEIGHT;
 
-	pthread_mutex_init(&de->q_lock, NULL);
 	sem_init(&de->display_start_sem, 0, 0);
 
 	get_server_references(es);
@@ -1489,7 +1478,7 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 		de->aux[i].fd = -1;
 	}
 
-	de->prod_fd = eventfd(0, EFD_NONBLOCK);
+	de->prod_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
 
 	assert(pthread_create(&de->q_thread, NULL, display_thread, de) == 0);
 
@@ -1532,10 +1521,6 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 	pthread_join(de->q_thread, NULL);
 	if (de->prod_fd != -1)
 		close(de->prod_fd);
-	pthread_mutex_destroy(&de->q_lock);
-
-	for (unsigned int i = 0; i != FQLEN; ++i)
-		av_frame_free(de->frame_q + i);
 
 	LOG(">>> %s\n", __func__);
 
@@ -1543,6 +1528,109 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 	wl_display_disconnect(es->native_display);
 	LOG("Display disconnected !\n");
 
+	thing_q_uninit(&de->q_in);
+	thing_q_uninit(&de->q_out);
 	free(de);
+}
+
+static void
+mkbar(struct dmabuf_h * const b, const unsigned int n2)
+{
+	uint8_t * buf;
+	const unsigned int n = n2 & 127;
+	unsigned int k;
+
+	dmabuf_write_start(b);
+	buf = dmabuf_map(b);
+
+	for (k = 0; k < BUF_W; k += 128) {
+		uint8_t * restrict p = buf + k * BUF_STRIDE2;
+		unsigned int j;
+		unsigned int i;
+
+		j = 0;
+		if (n > 128 - 16)
+		{
+			for (; j != n - (128 - 16); ++j)
+				*p++ = BAR_Y;
+		}
+		for (; j != n; ++j)
+			*p++ = BKG_Y;
+
+		for (i = 0; i != BUF_H - 1; ++i) {
+			for (j = 0; j != 16; ++j)
+				*p++ = BAR_Y;
+			for (j = 0; j != 128 - 16; ++j)
+				*p++ = BKG_Y;
+		}
+
+		if (n > 128 - 16)
+		{
+			for (j = n; j != 128; ++j)
+				*p++ = BAR_Y;
+		}
+		else
+		{
+			for (j = n; j != n + 16; ++j)
+				*p++ = BAR_Y;
+			for (; j != 128; ++j)
+				*p++ = BKG_Y;
+		}
+	}
+
+	dmabuf_write_end(b);
+}
+
+int
+main(int argc, char *argv[])
+{
+	struct egl_wayland_out_env * const de = dmabuf_wayland_out_new(false);
+	struct dmabufs_ctl * dbsc = dmabufs_ctl_new();
+	unsigned int i;
+
+	(void)argc;
+	(void)argv;
+
+	if (!de) {
+		fprintf(stderr, "Failed to open window\n");
+		return 1;
+	}
+	if (!dbsc) {
+		fprintf(stderr, "Failed to open CMA\n");
+		return 1;
+	}
+
+	thing_q_init(&de->q_in);
+	thing_q_init(&de->q_out);
+
+	for (i = 0; i != DBCOUNT; ++i) {
+		struct dmabuf_h * buf;
+
+		if ((buf = dmabuf_alloc(dbsc, BUFSIZE)) == NULL) {
+			fprintf(stderr, "Failed to alloc buf %d, size %d\n", i, BUFSIZE);
+			return 1;
+		}
+		dmabuf_write_start(buf);
+		memset(dmabuf_map(buf), 0x80, BUFSIZE);
+		dmabuf_write_end(buf);
+		q_thing(&de->q_out, buf);
+	}
+	sem_init(&de->free_sem, 0, DBCOUNT);
+
+	i = 0;
+	for (;;) {
+		struct dmabuf_h * buf;
+		sem_wait(&de->free_sem);
+		while ((buf = dq_thing(&de->q_out)) != NULL) {
+			mkbar(buf, i++);
+			q_thing(&de->q_in, buf);
+		}
+		printf("Q len: %d\n", (de->q_in.p_in - de->q_in.p_out) & (FQLEN - 1));
+		display_prod(de);
+	}
+
+	dmabufs_ctl_unref(&dbsc);
+
+	return 0;
 }
 
