@@ -44,9 +44,9 @@
 #define TRACE_ALL 1
 #define  DEBUG_SOLID 0
 
-#define ES_SIG 0x12345678
+#define PACE_TIME 12000
 
-#define W_SUBSURFACE 0
+#define ES_SIG 0x12345678
 
 struct wl_egl_window *egl_window;
 struct wl_region *region;
@@ -111,6 +111,7 @@ struct egl_wayland_out_env
 	int window_x, window_y;
 	int fullscreen;
 
+	uint64_t last_display;
 	egl_aux_t aux[32];
 
 	pthread_t q_thread;
@@ -134,108 +135,12 @@ struct egl_wayland_out_env
 
 bool program_alive;
 
-
-/* Shared memory support code */
-static void
-randname(char *buf)
+static uint64_t us_time()
 {
 	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	long r = ts.tv_nsec;
-	for (int i = 0; i < 6; ++i) {
-		buf[i] = 'A'+(r&15)+(r&16)*2;
-		r >>= 5;
-	}
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (ts.tv_nsec / 1000) + ((uint64_t)ts.tv_sec * 1000000);
 }
-
-static int
-create_shm_file(void)
-{
-	int retries = 100;
-	do {
-		char name[] = "/wl_shm-XXXXXX";
-		randname(name + sizeof(name) - 7);
-		--retries;
-		int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-		if (fd >= 0) {
-			shm_unlink(name);
-			return fd;
-		}
-	} while (retries > 0 && errno == EEXIST);
-	return -1;
-}
-
-static int
-allocate_shm_file(size_t size)
-{
-	int fd = create_shm_file();
-	if (fd < 0)
-		return -1;
-	int ret;
-	do {
-		ret = ftruncate(fd, size);
-	} while (ret < 0 && errno == EINTR);
-	if (ret < 0) {
-		close(fd);
-		return -1;
-	}
-	return fd;
-}
-
-static void
-shm_buffer_release(void *data, struct wl_buffer *wl_buffer)
-{
-	(void)data;
-	/* Sent by the compositor when it's no longer using this buffer */
-	wl_buffer_destroy(wl_buffer);
-}
-
-static const struct wl_buffer_listener shm_buffer_listener = {
-	.release = shm_buffer_release,
-};
-
-static struct wl_buffer *
-draw_frame(struct _escontext * const es)
-{
-	const int width = 640, height = 480;
-	int stride = width * 4;
-	int size = stride * height;
-
-	int fd = allocate_shm_file(size);
-	if (fd == -1) {
-		return NULL;
-	}
-
-	uint32_t *data = mmap(NULL, size,
-			PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	if (data == MAP_FAILED) {
-		close(fd);
-		return NULL;
-	}
-
-	struct wl_shm_pool *pool = wl_shm_create_pool(es->w_shm, fd, size);
-	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
-			width, height, stride, WL_SHM_FORMAT_XRGB8888);
-	wl_shm_pool_destroy(pool);
-	close(fd);
-
-	/* Draw checkerboxed background */
-	for (int y = 0; y < height; ++y) {
-		for (int x = 0; x < width; ++x) {
-			if ((x + y / 8 * 8) % 16 < 8)
-				data[y * width + x] = 0xFF666666;
-			else
-				data[y * width + x] = 0xFFEEEEEE;
-		}
-	}
-
-	munmap(data, size);
-	wl_buffer_add_listener(buffer, &shm_buffer_listener, NULL);
-	return buffer;
-}
-
-
-
 
 static int
 check_support(const struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
@@ -303,34 +208,10 @@ create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params
 {
 	struct dmabuf_w_env_s * const dbe = data;
 	struct _escontext * const es = dbe->es;
-	AVBufferRef * buf = dbe->buf;
-#if 0
-	ConstructBufferData *d = data;
 
-	g_mutex_lock(&d->lock);
-	d->wbuf = new_buffer;
-	g_cond_signal(&d->cond);
-	g_mutex_unlock(&d->lock);
-#endif
-	printf("%s: ok data=%p, buf=%p, es=%p, %dx%d\n", __func__, data, (void*)buf, (void*)es, es->req_w, es->req_h);
-	fflush(stdout);
 	zwp_linux_buffer_params_v1_destroy(params);
 
 	wl_buffer_add_listener(new_buffer, &w_buffer_listener, dbe);
-
-	// *************
-	assert(es->sig == ES_SIG);
-	if (0)
-	{
-	wl_buffer_destroy(new_buffer);
-	dmabuf_w_env_delete(dbe);
-	new_buffer = draw_frame(es);
-	}
-	// *************
-
-//	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
-//	wl_surface_damage(es->w_surface2, 0, 0, INT32_MAX, INT32_MAX);
-//    wl_surface_commit(es->w_surface2);
 
 	wl_surface_attach(es->w_surface, new_buffer, 0, 0);
 	wp_viewport_set_destination(es->w_viewport, es->req_w, es->req_h);
@@ -342,14 +223,6 @@ static void
 create_wl_dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 {
 	struct dmabuf_w_env_s * const dbe = data;
-#if 0
-	ConstructBufferData *d = data;
-
-	g_mutex_lock(&d->lock);
-	d->wbuf = NULL;
-	g_cond_signal(&d->cond);
-	g_mutex_unlock(&d->lock);
-#endif
 	(void)data;
 	printf("%s: FAILED\n", __func__);
 	zwp_linux_buffer_params_v1_destroy(params);
@@ -412,34 +285,6 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 
 	zwp_linux_buffer_params_v1_create(params, width, height, format, flags);
 
-#if 0
-	/* Wait for the request answer */
-	wl_display_flush(gst_wl_display_get_display(display));
-	data.wbuf = (gpointer)0x1;
-	timeout = g_get_monotonic_time() + G_TIME_SPAN_SECOND;
-	while (data.wbuf == (gpointer)0x1) {
-		if (!g_cond_wait_until(&data.cond, &data.lock, timeout)) {
-			GST_ERROR_OBJECT(mem->allocator, "zwp_linux_buffer_params_v1 time out");
-			zwp_linux_buffer_params_v1_destroy(params);
-			data.wbuf = NULL;
-		}
-	}
-
-out:
-	if (!data.wbuf) {
-		GST_ERROR_OBJECT(mem->allocator, "can't create linux-dmabuf buffer");
-	} else {
-		GST_DEBUG_OBJECT(mem->allocator, "created linux_dmabuf wl_buffer (%p):"
-				 "%dx%d, fmt=%.4s, %d planes",
-				 data.wbuf, width, height, (char *)&format, nplanes);
-	}
-
-	g_mutex_unlock(&data.lock);
-	g_mutex_clear(&data.lock);
-	g_cond_clear(&data.cond);
-
-	return data.wbuf;
-#endif
 	return NULL;
 }
 
@@ -756,6 +601,7 @@ gl_setup()
 static void
 q_frame(struct egl_wayland_out_env * const de, AVFrame ** const pframe)
 {
+	sem_wait(&de->q_sem);
 	pthread_mutex_lock(&de->q_lock);
 	de->frame_q[de->fq_in] = *pframe;
 	if (++de->fq_in >= FQLEN)
@@ -780,6 +626,9 @@ dq_frame(struct egl_wayland_out_env * const de)
 			de->fq_out = 0;
 	}
 	pthread_mutex_unlock(&de->q_lock);
+
+	if (frame)
+		sem_post(&de->q_sem);
 
 	return frame;
 }
@@ -863,44 +712,56 @@ static void* display_thread(void *v)
 		if (wl_display_flush(es->native_display) == -1 && errno == EAGAIN)
 			wl_poll_out = 1;
 
-		pollfds[0] = (struct pollfd){.fd = de->prod_fd, .events = POLLIN};
-		pollfds[1] = (struct pollfd){.fd = wl_fd, .events = wl_poll_out ? POLLIN | POLLOUT : POLLIN};
-
 		do {
-			rv = poll(pollfds, 2, -1);
-		} while (rv < 0 && errno == EINTR);
+			pollfds[0] = (struct pollfd){.fd = de->prod_fd, .events = POLLIN };
+			pollfds[1] = (struct pollfd){.fd = wl_fd, .events = wl_poll_out ? POLLIN | POLLOUT : POLLIN};
 
-		if (rv < 0)
-		{
-			LOG("Poll failed: %s\n", strerror(errno));
-			break;
-		}
-		if (rv == 0)
-		{
-			LOG("Poll unexpected timeout\n");
-			break;
-		}
+			do {
+				rv = poll(pollfds, 2, 10);
+			} while (rv < 0 && errno == EINTR);
+
+			if (rv < 0)
+			{
+				LOG("Poll failed: %s\n", strerror(errno));
+				goto fail;
+			}
+			if (rv == 0)
+			{
+				LOG("Poll timeout\n");
+			}
+
+			if (pollfds[0].revents)
+			{
+				uint64_t rcount = 0;
+				if (read(de->prod_fd, &rcount, sizeof(rcount)) != sizeof(rcount))
+					LOG("Unexpected prod read\n");
+			}
+
+			uint64_t now = us_time();
+
+			printf("now=%"PRId64", last=%"PRId64", diff=%"PRId64"\n", now, de->last_display, now - de->last_display);
+
+			if ((uint64_t)(now - de->last_display) >= PACE_TIME) {
+
+				if (now - de->last_display > 1000000)
+					de->last_display = now;
+				else
+					de->last_display += PACE_TIME;
+
+				if ((frame = dq_frame(de)) != NULL)
+				{
+					if (de->is_egl)
+						do_display(de, es, frame);
+					else
+						do_display_dmabuf(es, frame);
+					av_frame_free(&frame);
+					break;
+				}
+			}
+		} while (pollfds[1].revents == 0);
 
 		if (wl_display_read_events(es->native_display) != 0)
 			LOG("Read Event Failed\n");
-
-		if (pollfds[0].revents)
-		{
-			uint64_t rcount = 0;
-			if (read(de->prod_fd, &rcount, sizeof(rcount)) != sizeof(rcount))
-				LOG("Unexpected prod read\n");
-
-			frame = dq_frame(de);
-
-			if (frame)
-			{
-				if (de->is_egl)
-					do_display(de, es, frame);
-				else
-					do_display_dmabuf(es, frame);
-				av_frame_free(&frame);
-			}
-		}
 	}
 
 #if TRACE_ALL
@@ -1415,6 +1276,7 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 
 	pthread_mutex_init(&de->q_lock, NULL);
 	sem_init(&de->display_start_sem, 0, 0);
+	sem_init(&de->q_sem, 0, 24);
 
 	get_server_references(es);
 
@@ -1449,17 +1311,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 		zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
 	}
 
-#if W_SUBSURFACE
-	es->w_surface2 = wl_compositor_create_surface(es->w_compositor);
-	es->w_subsurface2 = wl_subcompositor_get_subsurface(es->w_subcompositor, es->w_surface2, es->w_surface);
-	wl_subsurface_set_position(es->w_subsurface2, -20, -20);
-	wl_subsurface_place_above(es->w_subsurface2, es->w_surface);
-	wl_subsurface_set_sync(es->w_subsurface2);
-
-	wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
-	wl_surface_commit(es->w_surface2);
-#endif
-
 	wl_surface_commit(es->w_surface);
 
 	// This call the attached listener global_registry_handler
@@ -1467,15 +1318,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 	wl_display_roundtrip(es->native_display);
 
 	LOG("--- post round 2--\n");
-
-// *****
-
-//	while (wl_display_dispatch(es->native_display))
-//	{
-//  	/* This space deliberately left blank */
-//	}
-
-// *****
 
 	if (is_egl)
 		CreateWindowWithEGLContext(es, "Nya");
@@ -1541,6 +1383,7 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 
 	destroy_window(es);
 	wl_display_disconnect(es->native_display);
+	sem_destroy(&de->q_sem);
 	LOG("Display disconnected !\n");
 
 	free(de);

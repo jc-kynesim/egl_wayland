@@ -43,9 +43,9 @@
 #define  DEBUG_SOLID 0
 
 #define DBCOUNT 32
-#define BUF_W 1920
+#define BUF_W 640
 #define BUF_STRIDE ((BUF_W + 127) & ~127)
-#define BUF_H 1080
+#define BUF_H 480
 #define BUF_STRIDE2 (BUF_H * 3/2)
 #define BUFSIZE (BUF_STRIDE * BUF_STRIDE2)
 #define BAR_Y 0xff
@@ -799,7 +799,7 @@ gl_setup()
 	return 0;
 }
 
-#define PACE_TIME 15000
+#define PACE_TIME 10000
 
 static void* display_thread(void *v)
 {
