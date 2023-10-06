@@ -9,15 +9,9 @@ project(
 wl_client_dep = dependency('wayland-client')
 wl_protocol_dep = dependency('wayland-protocols')
 wl_egl_dep = dependency('wayland-egl')
-epoxy_dep = dependency('epoxy')
 threads_dep = dependency('threads')
 
 wl_scanner = find_program('wayland-scanner')
-
-wl_sources = [
-    'hello_egl_wayland.c',
-    'init_window.c',
-]
 
 wl_headers = [
 ]
@@ -54,41 +48,10 @@ extra_c_args = [
 
 dep_rt = meson.get_compiler('c').find_library('rt')
 
-executable('hello_egl_wayland',
-  wl_sources + protocols_files,
-  install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
-    threads_dep,
-    dep_rt,
-    dependency('libavcodec'),
-    dependency('libavfilter'),
-    dependency('libavformat'),
-    dependency('libavutil'),
-  ]
-)
-
-executable('dtest',
-  ['dtest.c', 'dmabuf_alloc.c'] + protocols_files,
-  install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
-    threads_dep,
-    dep_rt,
-  ]
-)
-
-executable('waytest',
-  ['waytest.c', 'pollqueue.c'] + protocols_files,
-  install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep,
-    threads_dep,
-    dep_rt,
-  ]
-)
-
 executable('fstest',
   ['fstest.c', 'picpool.c', 'dmabuf_alloc.c'] + protocols_files,
   install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
+  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep,
     threads_dep,
     dep_rt,
   ]

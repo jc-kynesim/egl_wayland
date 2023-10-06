@@ -10,8 +10,6 @@
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 
-#include "init_window.h"
-//#include "log.h"
 #define LOG printf
 
 #include <assert.h>
@@ -23,20 +21,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <math.h>
-
 #include <libdrm/drm_fourcc.h>
 
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/poll.h>
 #include <sys/time.h>
 
-#include <epoxy/gl.h>
-#include <epoxy/egl.h>
-
 #include <pthread.h>
-#include <semaphore.h>
 
 #include "picpool.h"
 #include "dmabuf_alloc.h"
@@ -72,10 +61,6 @@ struct _escontext {
     struct zxdg_decoration_manager_v1 *x_decoration;
     struct wp_viewporter *w_viewporter;
     struct wp_viewport *w_viewport;
-    EGLDisplay display;
-    EGLContext context;
-    EGLSurface surface;
-
     unsigned int sig;
 };
 
@@ -84,24 +69,11 @@ struct _escontext ESContext = {
     .window_width = 0,
     .window_height = 0,
     .native_window  = 0,
-    .display = NULL,
-    .context = NULL,
-    .surface = NULL,
     .sig = ES_SIG
 };
 
-typedef struct egl_aux_s {
-    int fd;
-    GLuint texture;
-} egl_aux_t;
-
-
-#define FQLEN 128
-
 struct egl_wayland_out_env {
     struct _escontext *es;
-
-    enum AVPixelFormat avfmt;
 
     int show_all;
     int window_width, window_height;
@@ -110,15 +82,8 @@ struct egl_wayland_out_env {
     bool use_shm;
     bool chequerboard;
 
-    uint64_t last_display;
-    egl_aux_t aux[32];
-
-    pthread_t q_thread;
-    pthread_mutex_t q_lock;
-    sem_t display_start_sem;
-    sem_t q_sem;
-    int prod_fd;
-    bool is_egl;
+    int offset_x;
+    int offset_y;
 
     picpool_ctl_t * subpic_pool;
 
@@ -130,134 +95,6 @@ struct egl_wayland_out_env {
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
 
-bool program_alive;
-
-#if 0
-static uint64_t us_time()
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (ts.tv_nsec / 1000) + ((uint64_t)ts.tv_sec * 1000000);
-}
-
-
-static GLint
-compile_shader(GLenum target, const char *source)
-{
-    GLuint s = glCreateShader(target);
-
-    if (s == 0) {
-        LOG("Failed to create shader\n");
-        return 0;
-    }
-
-    glShaderSource(s, 1, (const GLchar **)&source, NULL);
-    glCompileShader(s);
-
-    {
-        GLint ok;
-        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-
-        if (!ok) {
-            GLchar *info;
-            GLint size;
-
-            glGetShaderiv(s, GL_INFO_LOG_LENGTH, &size);
-            info = malloc(size);
-
-            glGetShaderInfoLog(s, size, NULL, info);
-            LOG("Failed to compile shader: %ssource:\n%s\n", info, source);
-
-            return 0;
-        }
-    }
-
-    return s;
-}
-
-static GLuint link_program(GLint vs, GLint fs)
-{
-    GLuint prog = glCreateProgram();
-
-    if (prog == 0) {
-        LOG("Failed to create program\n");
-        return 0;
-    }
-
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-
-    {
-        GLint ok;
-        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-        if (!ok) {
-            /* Some drivers return a size of 1 for an empty log.  This is the size
-             * of a log that contains only a terminating NUL character.
-             */
-            GLint size;
-            GLchar *info = NULL;
-            glGetProgramiv(prog, GL_INFO_LOG_LENGTH, &size);
-            if (size > 1) {
-                info = malloc(size);
-                glGetProgramInfoLog(prog, size, NULL, info);
-            }
-
-            LOG("Failed to link: %s\n",
-                (info != NULL) ? info : "<empty log>");
-            return 0;
-        }
-    }
-
-    return prog;
-}
-
-static int
-gl_setup()
-{
-    const char *vs =
-        "attribute vec4 pos;\n"
-        "varying vec2 texcoord;\n"
-        "\n"
-        "void main() {\n"
-        "  gl_Position = pos;\n"
-        "  texcoord.x = (pos.x + 1.0) / 2.0;\n"
-        "  texcoord.y = (-pos.y + 1.0) / 2.0;\n"
-        "}\n";
-    const char *fs =
-        "#extension GL_OES_EGL_image_external : enable\n"
-        "precision mediump float;\n"
-        "uniform samplerExternalOES s;\n"
-        "varying vec2 texcoord;\n"
-        "void main() {\n"
-        "  gl_FragColor = texture2D(s, texcoord);\n"
-        "}\n";
-
-    GLuint vs_s;
-    GLuint fs_s;
-    GLuint prog;
-
-    if (!(vs_s = compile_shader(GL_VERTEX_SHADER, vs)) ||
-        !(fs_s = compile_shader(GL_FRAGMENT_SHADER, fs)) ||
-        !(prog = link_program(vs_s, fs_s)))
-        return -1;
-
-    glUseProgram(prog);
-
-    {
-        static const float verts[] = {
-            -1, -1,
-            1, -1,
-            1, 1,
-            -1, 1,
-        };
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
-    }
-
-    glEnableVertexAttribArray(0);
-    return 0;
-}
-#endif
 
 static void xdg_toplevel_handle_configure(void *data,
                                           struct xdg_toplevel *xdg_toplevel, int32_t w, int32_t h,
@@ -286,9 +123,6 @@ static void xdg_toplevel_handle_close(void *data,
 {
     (void)data;
     (void)xdg_toplevel;
-
-    // window closed, be sure that this event gets processed
-    program_alive = false;
 }
 
 static void
@@ -351,19 +185,10 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener = {
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
                                   uint32_t serial)
 {
-    struct egl_wayland_out_env *const de = data;
-//	struct _escontext *const es = de->es;
+    (void)data;
     LOG("%s\n", __func__);
     // confirm that you exist to the compositor
     xdg_surface_ack_configure(xdg_surface, serial);
-
-    // ********************
-//	struct wl_buffer *buffer = draw_frame(es);
-//	wl_surface_attach(es->w_surface, buffer, 0, 0);
-//	wl_surface_commit(es->w_surface);
-    // ********************
-
-    sem_post(&de->display_start_sem);  //***********
 }
 
 const struct xdg_surface_listener xdg_surface_listener = {
@@ -395,98 +220,9 @@ void CreateNativeWindow(struct _escontext *const es, char *title)
     es->window_height = es->req_h;
 }
 
-EGLBoolean CreateEGLContext(struct _escontext *const es)
-{
-    EGLint numConfigs;
-    EGLint majorVersion;
-    EGLint minorVersion;
-    EGLContext context;
-    EGLSurface surface;
-    EGLConfig config;
-    EGLint fbAttribs[] =
-    {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_RED_SIZE,   	 8,
-        EGL_GREEN_SIZE, 	 8,
-        EGL_BLUE_SIZE,  	 8,
-        EGL_NONE
-    };
-    EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE, EGL_NONE };
-    EGLDisplay display = eglGetDisplay(es->native_display);
-    if (display == EGL_NO_DISPLAY) {
-        LOG("No EGL Display...\n");
-        return EGL_FALSE;
-    }
-
-    // Initialize EGL
-    if (!eglInitialize(display, &majorVersion, &minorVersion)) {
-        LOG("No Initialisation...\n");
-        return EGL_FALSE;
-    }
-
-    LOG("EGL init: version %d.%d\n", majorVersion, minorVersion);
-
-    eglBindAPI(EGL_OPENGL_ES_API);
-
-    // Get configs
-    if ((eglGetConfigs(display, NULL, 0, &numConfigs) != EGL_TRUE) || (numConfigs == 0)) {
-        LOG("No configuration...\n");
-        return EGL_FALSE;
-    }
-    LOG("GL Configs: %d\n", numConfigs);
-
-    // Choose config
-    if ((eglChooseConfig(display, fbAttribs, &config, 1, &numConfigs) != EGL_TRUE) || (numConfigs != 1)) {
-        LOG("No configuration...\n");
-        return EGL_FALSE;
-    }
-
-    es->native_window =
-        wl_egl_window_create(es->w_surface, es->window_width, es->window_height);
-
-    if (es->native_window == EGL_NO_SURFACE) {
-        LOG("No window !?\n");
-        return EGL_FALSE;
-    }
-    else
-        LOG("Window created !\n");
-
-    // Create a surface
-    surface = eglCreateWindowSurface(display, config, es->native_window, NULL);
-    if (surface == EGL_NO_SURFACE) {
-        LOG("No surface...\n");
-        return EGL_FALSE;
-    }
-
-    // Create a GL context
-    context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
-    if (context == EGL_NO_CONTEXT) {
-        LOG("No context...\n");
-        return EGL_FALSE;
-    }
-
-    es->display = display;
-    es->surface = surface;
-    es->context = context;
-    return EGL_TRUE;
-}
-
-static EGLBoolean CreateWindowWithEGLContext(struct _escontext *const es, char *title)
-{
-    CreateNativeWindow(es, title);
-    return CreateEGLContext(es);
-}
-
 static void CreateWindowForDmaBuf(struct _escontext *const es, char *title)
 {
     CreateNativeWindow(es, title);
-}
-
-unsigned long last_click = 0;
-void RefreshWindow()
-{
-    eglSwapBuffers(ESContext.display, ESContext.surface);
 }
 
 static void linux_dmabuf_v1_listener_format(void *data,
@@ -605,11 +341,6 @@ get_server_references(struct _escontext *const es)
 
 void destroy_window(struct _escontext *const es)
 {
-    eglDestroySurface(es->display, es->surface);
-    eglDestroyContext(es->display, es->context);
-    wl_egl_window_destroy(es->native_window);
-    xdg_toplevel_destroy(XDGToplevel);
-    xdg_surface_destroy(XDGSurface);
     wl_surface_destroy(es->w_surface);
 }
 
@@ -697,7 +428,7 @@ make_background(struct egl_wayland_out_env *de, struct _escontext *const es)
     }
 
 //    wl_buffer_add_listener(w_buffer, &w_buffer_listener, dh);
-    wl_surface_attach(es->w_surface, w_buffer, 100, 100);
+    wl_surface_attach(es->w_surface, w_buffer, de->offset_x, de->offset_y);
     dh = NULL;
 
     wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
@@ -716,23 +447,23 @@ int main(int argc, char *argv[])
     struct egl_wayland_out_env *de = calloc(1, sizeof(*de));
     struct _escontext *const es = &ESContext;
     const bool fullscreen = true;
-    (void)argc;
-    (void)argv;
+
+    if (argc != 3) {
+        LOG("Usage: fstest <x> <y>\n"
+            "Put a 640x480 checquerboard on a fullscreen at x, y for 10 secs\n");
+        return 1;
+    }
 
     LOG("<<< %s\n", __func__);
 
     de->es = es;
-    de->prod_fd = -1;
-    de->is_egl = false;
     de->use_shm = true;
     de->chequerboard = true;
+    de->offset_x = atoi(argv[1]);
+    de->offset_y = atoi(argv[2]);
 
     es->req_w = WINDOW_WIDTH;
     es->req_h = WINDOW_HEIGHT;
-
-    pthread_mutex_init(&de->q_lock, NULL);
-    sem_init(&de->display_start_sem, 0, 0);
-    sem_init(&de->q_sem, 0, 24);
 
     get_server_references(es);
 
@@ -790,16 +521,11 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (de->is_egl)
-        CreateWindowWithEGLContext(es, "Nya");
-    else
-        CreateWindowForDmaBuf(es, "Dma");
+    CreateWindowForDmaBuf(es, "Dma");
 
     make_background(de, es);
 
-    LOG(">>> %s\n", __func__);
-
-    program_alive = true;
+    LOG(">>> %s: Chequerboard at %d, %d\n", __func__, de->offset_x, de->offset_y);
 
     sleep(10);
 
@@ -807,7 +533,6 @@ int main(int argc, char *argv[])
 
     destroy_window(es);
     wl_display_disconnect(es->native_display);
-    sem_destroy(&de->q_sem);
     LOG("Display disconnected !\n");
 
     free(de);
