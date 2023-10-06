@@ -77,6 +77,7 @@ struct _escontext
 	EGLContext context;
 	EGLSurface surface;
 
+	AVBufferRef * delay_buf;
 	unsigned int sig;
 };
 
@@ -184,6 +185,9 @@ dmabuf_w_env_new(struct _escontext *const es, AVBufferRef * const buf)
 static void
 dmabuf_w_env_delete(struct dmabuf_w_env_s * const dbe)
 {
+	av_buffer_unref(&dbe->es->delay_buf);
+	dbe->es->delay_buf = dbe->buf;
+
 	av_buffer_unref(&dbe->buf);
 	free(dbe);
 }
@@ -1372,6 +1376,7 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 	de->q_terminate = 1;
 	display_prod(de);
 	pthread_join(de->q_thread, NULL);
+	av_buffer_unref(&es->delay_buf);
 	if (de->prod_fd != -1)
 		close(de->prod_fd);
 	pthread_mutex_destroy(&de->q_lock);
