@@ -5,6 +5,7 @@
 #include <wayland-client-protocol.h>
 #include <wayland-egl.h> // Wayland EGL MUST be included before EGL headers
 
+#include "single-pixel-buffer-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
@@ -56,6 +57,7 @@ struct _escontext {
     struct wl_surface *w_surface2;
     struct wl_subsurface *w_subsurface2;
     struct zwp_linux_dmabuf_v1 *linux_dmabuf_v1_bind;
+    struct wp_single_pixel_buffer_manager_v1 *single_pixel_buffer_manager_v1;
     struct wl_shm *w_shm;
     struct wl_subcompositor *w_subcompositor;
     struct zxdg_decoration_manager_v1 *x_decoration;
@@ -81,6 +83,7 @@ struct egl_wayland_out_env {
     int fullscreen;
     bool use_shm;
     bool chequerboard;
+    bool single_pixel;
 
     int offset_x;
     int offset_y;
@@ -293,6 +296,8 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
         es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
     if (strcmp(interface, wp_viewporter_interface.name) == 0)
         es->w_viewporter = wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
+    if (strcmp(interface, wp_single_pixel_buffer_manager_v1_interface.name) == 0)
+        es->single_pixel_buffer_manager_v1 = wl_registry_bind(registry, id, &wp_single_pixel_buffer_manager_v1_interface, 1);
 }
 
 static void global_registry_remover(void *data, struct wl_registry *registry, uint32_t id)
@@ -441,6 +446,14 @@ error:
     return -1;
 }
 
+static void
+sp_buffer_release_cb(void *data, struct wl_buffer *buffer)
+{
+    int * pCount = data;
+    ++*pCount;
+    wl_buffer_destroy(buffer);
+    LOG("%s\n", __func__);
+}
 
 int main(int argc, char *argv[])
 {
@@ -448,9 +461,17 @@ int main(int argc, char *argv[])
     struct _escontext *const es = &ESContext;
     const bool fullscreen = true;
 
+    if (argc > 1 && argv[1][0] == 's') {
+        de->single_pixel = true;
+        argv++;
+        argc --;
+    }
+
     if (argc != 3) {
-        LOG("Usage: fstest <x> <y>\n"
-            "Put a 640x480 checquerboard on a fullscreen at x, y for 10 secs\n");
+        LOG("Usage: fstest [s] <x> <y>\n"
+            "s  Use 8 single pixel buffers rather than chequerboard\n"
+            "   N.B. offset each time so should progress down screen?\n"
+            "Put a 640x480 chequerboard on a fullscreen at x, y for 10 secs\n");
         return 1;
     }
 
@@ -523,11 +544,47 @@ int main(int argc, char *argv[])
 
     CreateWindowForDmaBuf(es, "Dma");
 
-    make_background(de, es);
+    if (!de->single_pixel) {
+        make_background(de, es);
+        LOG(">>> %s: Chequerboard at %d, %d\n", __func__, de->offset_x, de->offset_y);
+        sleep(10);
+    }
+    else
+    {
+        int count_out = 0;
+        int i;
 
-    LOG(">>> %s: Chequerboard at %d, %d\n", __func__, de->offset_x, de->offset_y);
+        if (!es->single_pixel_buffer_manager_v1) {
+            LOG("*** Single pixel not supported\n");
+            exit(1);
+        }
 
-    sleep(10);
+        wp_viewport_set_destination(es->w_viewport, 640, 480);
+
+        for (i = 0; i != 10; ++i) {
+            struct wl_buffer * w_buffer = NULL;
+            static const struct wl_buffer_listener listener = {
+                .release = sp_buffer_release_cb,
+            };
+
+            if (i <= 7) {
+                w_buffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+                    es->single_pixel_buffer_manager_v1,
+                    (i & 1) != 0 ? UINT32_MAX : 0,
+                    (i & 2) != 0 ? UINT32_MAX : 0,
+                    (i & 4) != 0 ? UINT32_MAX : 0,
+                    UINT32_MAX);  // R, G, B, A
+                wl_buffer_add_listener(w_buffer, &listener, &count_out);
+            }
+            wl_surface_attach(es->w_surface, w_buffer, de->offset_x, de->offset_y);
+            wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
+            wl_surface_commit(es->w_surface);
+            usleep(500000);
+            wl_display_roundtrip(es->native_display);
+            LOG("Count out = %d, in = %d\n", count_out, i < 8 ? i + 1 : 8);
+            usleep(500000);
+        }
+    }
 
     LOG(">>> %s\n", __func__);
 
