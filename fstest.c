@@ -53,9 +53,15 @@ struct _escontext {
     int req_h;
     struct wl_egl_window *native_window;
     struct wl_compositor *w_compositor;
+
     struct wl_surface *w_surface;
-    struct wl_surface *w_surface2;
-    struct wl_subsurface *w_subsurface2;
+    struct {
+        struct wl_surface *surface;
+        struct wl_subsurface *subsurface;
+        struct wl_surface *surface2;
+        struct wl_subsurface *subsurface2;
+    } subs[8];
+
     struct zwp_linux_dmabuf_v1 *linux_dmabuf_v1_bind;
     struct wp_single_pixel_buffer_manager_v1 *single_pixel_buffer_manager_v1;
     struct wl_shm *w_shm;
@@ -281,7 +287,7 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
     if (strcmp(interface, wl_compositor_interface.name) == 0)
         es->w_compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
     if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
-        es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 1);
+        es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 3);
         zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1_bind, &linux_dmabuf_v1_listener, es);
     }
     if (strcmp(interface, wl_shm_interface.name) == 0)
@@ -379,17 +385,45 @@ fill_uniform(uint32_t *const data, unsigned int stride, const unsigned int width
     }
 }
 
+static void
+tl_half_arrow(uint32_t *const data, unsigned int stride_b, const unsigned int width, const unsigned int height)
+{
+    unsigned int stride = stride_b / sizeof(uint32_t);
+
+    fill_uniform(data, stride_b, width, height, 0xff666666);
+    for (unsigned int y = 0; y < height / 3; ++y) {
+        unsigned int rhs = width * y / (height/2);
+        for (unsigned int x = rhs; x < width*2/3 ; ++x) {
+            data[y * stride + x] = 0xFFEEEEEE;
+        }
+    }
+}
+
+static const enum wl_output_transform transforms[8] = {
+    WL_OUTPUT_TRANSFORM_NORMAL,
+    WL_OUTPUT_TRANSFORM_FLIPPED,
+    WL_OUTPUT_TRANSFORM_FLIPPED_180,
+    WL_OUTPUT_TRANSFORM_180,
+    WL_OUTPUT_TRANSFORM_FLIPPED_270,
+    WL_OUTPUT_TRANSFORM_90,
+    WL_OUTPUT_TRANSFORM_270,
+    WL_OUTPUT_TRANSFORM_FLIPPED_90,
+};
+
+#define FILL_ARROW 2
+#define FILL_CHEQUERBOARD 1
+#define FILL_UNIFORM 0
+
 static int
-make_background(struct egl_wayland_out_env *de, struct _escontext *const es)
+make_pic(struct egl_wayland_out_env *de, struct _escontext *const es, struct wl_surface * const surface,
+         const unsigned int width, const unsigned int height, const int fillpat)
 {
     // Build a background
     // This would be a perfect use of the single_pixel_surface extension
     // However we don't seem to support it
     struct dmabuf_h * dh = NULL;
 
-    unsigned int width = de->chequerboard ? 640 : 32;
-    unsigned int height = de->chequerboard ? 480 : 32;
-    unsigned int stride = width * 4;
+    unsigned int stride = ((width + 15) & ~15)  * 4;
     struct wl_buffer * w_buffer;
 
     if ((dh = picpool_get(de->subpic_pool, stride * height)) == NULL) {
@@ -398,10 +432,17 @@ make_background(struct egl_wayland_out_env *de, struct _escontext *const es)
     }
 
     dmabuf_write_start(dh);
-    if (de->chequerboard)
+    switch (fillpat) {
+    case FILL_ARROW:
+        tl_half_arrow(dmabuf_map(dh), stride, width, height);
+        break;
+    case FILL_CHEQUERBOARD:
         chequerboard(dmabuf_map(dh), stride, width, height);
-    else
-        fill_uniform(dmabuf_map(dh), stride, width, height, 0xff000000);
+        break;
+    default:
+        fill_uniform(dmabuf_map(dh), stride, width, height, 0xff800000);
+        break;
+    }
     dmabuf_write_end(dh);
 
     if (de->use_shm)
@@ -433,12 +474,11 @@ make_background(struct egl_wayland_out_env *de, struct _escontext *const es)
     }
 
 //    wl_buffer_add_listener(w_buffer, &w_buffer_listener, dh);
-    wl_surface_attach(es->w_surface, w_buffer, de->offset_x, de->offset_y);
+    wl_surface_attach(surface, w_buffer, 0, 0);
     dh = NULL;
 
-    wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
-    wl_surface_commit(es->w_surface);
-    wl_display_roundtrip(es->native_display);
+    wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(surface);
     return 0;
 
 error:
@@ -446,45 +486,46 @@ error:
     return -1;
 }
 
-static void
-sp_buffer_release_cb(void *data, struct wl_buffer *buffer)
+static void usage()
 {
-    int * pCount = data;
-    ++*pCount;
-    wl_buffer_destroy(buffer);
-    LOG("%s\n", __func__);
+    LOG("Usage: fstest [s][f] <x> <y>\n"
+        "  s Use dmabuf for buffers - otherwise shm\n"
+        "  f Set fullscreen\n"
+        );
+    exit(1);
 }
 
 int main(int argc, char *argv[])
 {
     struct egl_wayland_out_env *de = calloc(1, sizeof(*de));
     struct _escontext *const es = &ESContext;
-    const bool fullscreen = true;
-
-    if (argc > 1 && argv[1][0] == 's') {
-        de->single_pixel = true;
-        argv++;
-        argc --;
-    }
-
-    if (argc != 3) {
-        LOG("Usage: fstest [s] <x> <y>\n"
-            "s  Use 8 single pixel buffers rather than chequerboard\n"
-            "   N.B. offset each time so should progress down screen?\n"
-            "Put a 640x480 chequerboard on a fullscreen at x, y for 10 secs\n");
-        return 1;
-    }
-
-    LOG("<<< %s\n", __func__);
+    unsigned int i;
+    unsigned int grid;
+    const unsigned int gap_h = 16;
+    const unsigned int gap_v = 32;
 
     de->es = es;
-    de->use_shm = true;
-    de->chequerboard = true;
-    de->offset_x = atoi(argv[1]);
-    de->offset_y = atoi(argv[2]);
+    de->use_shm = true;;
 
     es->req_w = WINDOW_WIDTH;
     es->req_h = WINDOW_HEIGHT;
+
+    for (++argv; argc > 1; argc--, argv++) {
+        const char * p = *argv;
+        char c;
+        while ((c = *p++) != 0) {
+            switch (c) {
+            case 'd':
+                de->use_shm = false;
+                break;
+            case 'f':
+                de->fullscreen = true;
+                break;
+            default:
+                usage();
+            }
+        }
+    }
 
     get_server_references(es);
 
@@ -505,7 +546,7 @@ int main(int argc, char *argv[])
     xdg_toplevel_add_listener(XDGToplevel, &xdg_toplevel_listener, es);
 
     xdg_toplevel_set_title(XDGToplevel, "Wayland EGL example");
-    if (fullscreen)
+    if (de->fullscreen)
         xdg_toplevel_set_fullscreen(XDGToplevel, NULL);
 
     if (!es->x_decoration) {
@@ -518,10 +559,37 @@ int main(int argc, char *argv[])
         zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
     }
 
+    {
+        unsigned int grid_a = (WINDOW_WIDTH - gap_h * 5) / 4;
+        unsigned int grid_b = (WINDOW_HEIGHT - gap_v * 3) / 2;
+        grid = grid_a < grid_b ? grid_a : grid_b;
+
+        for (i = 0; i != 8; i++) {
+            struct wl_surface * const surface = wl_compositor_create_surface(es->w_compositor);
+            struct wl_subsurface * const subsurface = wl_subcompositor_get_subsurface(es->w_subcompositor, surface, es->w_surface);
+            es->subs[i].surface = surface;
+            es->subs[i].subsurface = subsurface;
+            wl_surface_set_buffer_transform(surface, transforms[i]);
+            wl_subsurface_place_above(subsurface, es->w_surface);
+            wl_subsurface_set_position(subsurface, gap_h + (grid + gap_h) * (i % 4), gap_v + (grid + gap_v) * (i / 4));
+        }
+
+        for (i = 0; i != 8; i++) {
+            struct wl_surface * const parent = es->subs[i].surface;
+            struct wl_surface * const surface = wl_compositor_create_surface(es->w_compositor);
+            struct wl_subsurface * const subsurface = wl_subcompositor_get_subsurface(es->w_subcompositor, surface, parent);
+            es->subs[i].surface2 = surface;
+            es->subs[i].subsurface2 = subsurface;
+            wl_subsurface_place_above(subsurface, parent);
+            wl_subsurface_set_position(subsurface, gap_h, gap_v);
+            wl_surface_commit(surface);
+            wl_surface_commit(parent);
+        }
+    }
+
     wl_surface_commit(es->w_surface);
 
     // This call the attached listener global_registry_handler
-    wl_display_dispatch(es->native_display);
     wl_display_roundtrip(es->native_display);
 
     LOG("--- post round 2--\n");
@@ -544,47 +612,16 @@ int main(int argc, char *argv[])
 
     CreateWindowForDmaBuf(es, "Dma");
 
-    if (!de->single_pixel) {
-        make_background(de, es);
-        LOG(">>> %s: Chequerboard at %d, %d\n", __func__, de->offset_x, de->offset_y);
-        sleep(10);
+    for (i = 0; i != 8; i++) {
+        make_pic(de, es, es->subs[i].surface2, gap_h, gap_v, FILL_UNIFORM);
+        make_pic(de, es, es->subs[i].surface, grid, grid * 3/ 4, FILL_ARROW);
     }
-    else
-    {
-        int count_out = 0;
-        int i;
 
-        if (!es->single_pixel_buffer_manager_v1) {
-            LOG("*** Single pixel not supported\n");
-            exit(1);
-        }
+    make_pic(de, es, es->w_surface, WINDOW_WIDTH, WINDOW_HEIGHT, FILL_CHEQUERBOARD);
 
-        wp_viewport_set_destination(es->w_viewport, 640, 480);
+    wl_display_roundtrip(es->native_display);
 
-        for (i = 0; i != 10; ++i) {
-            struct wl_buffer * w_buffer = NULL;
-            static const struct wl_buffer_listener listener = {
-                .release = sp_buffer_release_cb,
-            };
-
-            if (i <= 7) {
-                w_buffer = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
-                    es->single_pixel_buffer_manager_v1,
-                    (i & 1) != 0 ? UINT32_MAX : 0,
-                    (i & 2) != 0 ? UINT32_MAX : 0,
-                    (i & 4) != 0 ? UINT32_MAX : 0,
-                    UINT32_MAX);  // R, G, B, A
-                wl_buffer_add_listener(w_buffer, &listener, &count_out);
-            }
-            wl_surface_attach(es->w_surface, w_buffer, de->offset_x, de->offset_y);
-            wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
-            wl_surface_commit(es->w_surface);
-            usleep(500000);
-            wl_display_roundtrip(es->native_display);
-            LOG("Count out = %d, in = %d\n", count_out, i < 8 ? i + 1 : 8);
-            usleep(500000);
-        }
-    }
+    sleep(20);
 
     LOG(">>> %s\n", __func__);
 
