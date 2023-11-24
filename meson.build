@@ -17,6 +17,7 @@ wl_scanner = find_program('wayland-scanner')
 wl_sources = [
     'hello_egl_wayland.c',
     'init_window.c',
+	'pollqueue.c',
 ]
 
 wl_headers = [
