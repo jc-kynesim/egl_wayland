@@ -62,6 +62,9 @@ typedef struct _escontext
     EGLDisplay display;
     EGLContext context;
     EGLSurface surface;
+    bool fmt_ok;
+    uint32_t last_fmt;
+    uint64_t last_mod;
 
     struct pollqueue *pq;
 
@@ -104,30 +107,6 @@ static inline uint64_t canon_mod(const uint64_t m)
     return fourcc_mod_is_vendor(m, BROADCOM) ? fourcc_mod_broadcom_mod(m) : m;
 }
 
-static bool
-check_support_egl(const struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
-{
-    EGLuint64KHR mods[16];
-    GLint mod_count = 0;
-    GLint i;
-    const uint64_t cmod = canon_mod(mod);
-
-    if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
-    {
-        LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
-        return false;
-    }
-
-    for (i = 0; i < mod_count; ++i)
-    {
-        if (mods[i] == cmod)
-            return true;
-    }
-
-    LOG("Failed to find modifier %"PRIx64"\n", cmod);
-    return false;
-}
-
 static struct dmabuf_w_env_s *
 dmabuf_w_env_new(struct _escontext *const es, AVBufferRef * const buf)
 {
@@ -158,6 +137,10 @@ dmabuf_fence_release_cb(void * v, short revents)
     dmabuf_w_env_free(v);
 }
 
+// ---------------------------------------------------------------------------
+//
+// Wayland dmabuf display function
+
 static void
 w_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
@@ -175,43 +158,6 @@ w_buffer_release(void *data, struct wl_buffer *wl_buffer)
     pollqueue_add_task(dbe->pt, -1);
 }
 
-static const struct wl_buffer_listener w_buffer_listener = {
-    .release = w_buffer_release,
-};
-
-static void
-create_wl_dmabuf_succeeded(void *data, struct zwp_linux_buffer_params_v1 *params,
-         struct wl_buffer *new_buffer)
-{
-    struct dmabuf_w_env_s * const dbe = data;
-    struct _escontext * const es = dbe->es;
-
-    zwp_linux_buffer_params_v1_destroy(params);
-
-    wl_buffer_add_listener(new_buffer, &w_buffer_listener, dbe);
-
-    wl_surface_attach(es->w_surface, new_buffer, 0, 0);
-    wp_viewport_set_destination(es->w_viewport, es->req_w, es->req_h);
-    wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
-    wl_surface_commit(es->w_surface);
-}
-
-static void
-create_wl_dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
-{
-    struct dmabuf_w_env_s * const dbe = data;
-    (void)data;
-
-    LOG("%s: FAILED\n", __func__);
-    zwp_linux_buffer_params_v1_destroy(params);
-    dmabuf_w_env_free(dbe);
-}
-
-static const struct zwp_linux_buffer_params_v1_listener params_wl_dmabuf_listener = {
-    create_wl_dmabuf_succeeded,
-    create_wl_dmabuf_failed
-};
-
 static struct wl_buffer*
 do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 {
@@ -220,9 +166,14 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
     const uint32_t format = desc->layers[0].format;
     const unsigned int width = av_frame_cropped_width(frame);
     const unsigned int height = av_frame_cropped_height(frame);
+    struct wl_buffer * w_buffer;
     unsigned int n = 0;
     unsigned int flags = 0;
     int i;
+
+    static const struct wl_buffer_listener w_buffer_listener = {
+        .release = w_buffer_release,
+    };
 
     LOG("<<< %s\n", __func__);
 
@@ -233,6 +184,7 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
         LOG("zwp_linux_dmabuf_v1_create_params FAILED\n");
         return NULL;
     }
+
 
     for (i = 0; i < desc->nb_layers; ++i)
     {
@@ -257,12 +209,61 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
 
     assert(es->sig == ES_SIG);
 
-    /* Request buffer creation */
-    zwp_linux_buffer_params_v1_add_listener(params, &params_wl_dmabuf_listener,
-        dmabuf_w_env_new(es, frame->buf[0]));
+    w_buffer = zwp_linux_buffer_params_v1_create_immed(params, width, height, format, flags);
+    zwp_linux_buffer_params_v1_destroy(params);
 
-    zwp_linux_buffer_params_v1_create(params, width, height, format, flags);
+    if (w_buffer == NULL)
+    {
+        LOG("Failed to create dmabuf\n");
+        return NULL;
+    }
+
+    wl_buffer_add_listener(w_buffer, &w_buffer_listener,
+                           dmabuf_w_env_new(es, frame->buf[0]));
+
+    wl_surface_attach(es->w_surface, w_buffer, 0, 0);
+    wp_viewport_set_destination(es->w_viewport, es->req_w, es->req_h);
+    wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(es->w_surface);
     return NULL;
+}
+
+// ---------------------------------------------------------------------------
+//
+// EGL display function
+
+static bool
+check_support_egl(struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
+{
+    EGLuint64KHR mods[16];
+    GLint mod_count = 0;
+    GLint i;
+    const uint64_t cmod = canon_mod(mod);
+
+    if (fmt == es->last_fmt || cmod == es->last_mod)
+        return es->fmt_ok;
+
+    es->last_fmt = fmt;
+    es->last_mod = cmod;
+    es->fmt_ok = false;
+
+    if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
+    {
+        LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
+        return false;
+    }
+
+    for (i = 0; i < mod_count; ++i)
+    {
+        if (mods[i] == cmod)
+        {
+            es->fmt_ok = true;
+            return true;
+        }
+    }
+
+    LOG("Failed to find modifier %"PRIx64"\n", cmod);
+    return false;
 }
 
 static void
@@ -298,17 +299,10 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
     LOG("<<< %s\n", __func__);
 #endif
 
+    if (!check_support_egl(es, desc->layers[0].format, desc->objects[0].format_modifier))
     {
-        static int z = 0;
-        if (!z)
-        {
-            z = 1;
-            if (!check_support_egl(es, desc->layers[0].format, desc->objects[0].format_modifier))
-            {
-                LOG("No support for format\n");
-                return;
-            }
-        }
+        LOG("No support for format\n");
+        return;
     }
 
     if (es->req_w != es->window_width || es->req_h != es->window_height) {
@@ -367,9 +361,6 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
 
     eglDestroyImageKHR(es->display, image);
 
-    glClearColor(0.5, 0.5, 0.5, 0.5);
-    glClear(GL_COLOR_BUFFER_BIT);
-
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     eglSwapBuffers(es->display, es->surface);
@@ -385,6 +376,10 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
     }
 }
 
+// ---------------------------------------------------------------------------
+//
+// GL setup code
+// Builds shaders, finds context
 
 static GLint
 compile_shader(GLenum target, const char *source)
@@ -414,6 +409,7 @@ compile_shader(GLenum target, const char *source)
 
             glGetShaderInfoLog(s, size, NULL, info);
             LOG("Failed to compile shader: %ssource:\n%s\n", info, source);
+            free(info);
 
             return 0;
         }
@@ -568,8 +564,6 @@ CreateEGLContext(struct _escontext * const es)
         LOG("No window !?\n");
         return EGL_FALSE;
     }
-    else
-        LOG("Window created !\n");
 
     // Create a surface
     surface = eglCreateWindowSurface(display, config, es->native_window, NULL);
@@ -627,26 +621,14 @@ do_egl_setup(void * v, short revents)
         LOG("%s: gl_setup failed\n", __func__);
         goto fail;
     }
-
-    {
-        EGLint fmts[128];
-        EGLint fcount = 0;
-        EGLint i;
-
-        eglQueryDmaBufFormatsEXT(wc->display, 128, fmts, &fcount);
-        LOG("DmaBuf formats found=%d\n", fcount);
-        for (i = 0; i != fcount; ++i)
-        {
-            LOG("[%d] %s\n", i, av_fourcc2str(fmts[i]));
-        }
-    }
-
     return;
 
 fail:
     de->q_terminate = 1;
     sem_post(&de->display_start_sem);
 }
+
+// ---------------------------------------------------------------------------
 
 static void try_display(struct egl_wayland_out_env * const de);
 
@@ -871,8 +853,10 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
 
     if (strcmp(interface, wl_compositor_interface.name) == 0)
         es->w_compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+    // Want version 2 as that has _create_immed which is much easier to use
+    // than the previous callbacks
     if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
-        es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 1);
+        es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 2);
         zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1_bind, &linux_dmabuf_v1_listener, es);
     }
     if (strcmp(interface, wl_subcompositor_interface.name) == 0)
