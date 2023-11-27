@@ -34,9 +34,7 @@
 //#include "log.h"
 #define LOG printf
 
-#define TRACE_ALL 1
-
-#define ES_SIG 0x12345678
+#define TRACE_ALL 0
 
 typedef struct _escontext
 {
@@ -56,10 +54,11 @@ typedef struct _escontext
 
     // Wayland objects
     struct wl_surface *surface;
-    struct zxdg_toplevel_decoration_v1 *decoration;
     struct wp_viewport *viewport;
     struct xdg_surface *wm_surface;
     struct xdg_toplevel *wm_toplevel;
+
+    struct wl_callback * frame_callback;
 
     // EGL
     struct wl_egl_window *w_egl_window;
@@ -69,8 +68,6 @@ typedef struct _escontext
     bool fmt_ok;
     uint32_t last_fmt;
     uint64_t last_mod;
-
-    unsigned int sig;
 } window_ctx_t;
 
 struct egl_wayland_out_env
@@ -178,7 +175,9 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
         .release = w_buffer_release,
     };
 
+#if TRACE_ALL
     LOG("<<< %s\n", __func__);
+#endif
 
     /* Creation and configuration of planes  */
     params = zwp_linux_dmabuf_v1_create_params(es->linux_dmabuf_v1);
@@ -209,8 +208,6 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
         if (!frame->top_field_first)
             flags |= ZWP_LINUX_BUFFER_PARAMS_V1_FLAGS_BOTTOM_FIRST;
     }
-
-    assert(es->sig == ES_SIG);
 
     w_buffer = zwp_linux_buffer_params_v1_create_immed(params, width, height, format, flags);
     zwp_linux_buffer_params_v1_destroy(params);
@@ -642,6 +639,7 @@ surface_frame_done_cb(void * data, struct wl_callback *cb, uint32_t time)
     struct egl_wayland_out_env * const de = data;
     (void)time;
 
+    de->wc.frame_callback = NULL;
     wl_callback_destroy(cb);
 
     de->frame_wait = false;
@@ -672,8 +670,8 @@ try_display(struct egl_wayland_out_env * const de)
     if (frame)
     {
         static const struct wl_callback_listener frame_listener = {.done = surface_frame_done_cb};
-        struct wl_callback * cb = wl_surface_frame(wc->surface);
-        wl_callback_add_listener(cb, &frame_listener, de);
+        wc->frame_callback = wl_surface_frame(wc->surface);
+        wl_callback_add_listener(wc->frame_callback, &frame_listener, de);
         de->frame_wait = true;
         if (de->show_all)
             sem_post(&de->q_sem);
@@ -932,23 +930,89 @@ fail:
 static void
 destroy_window(window_ctx_t * const es)
 {
+    if (!es->w_display)
+        return;
+
+    if (es->viewport)
+        wp_viewport_destroy(es->viewport);
+
     if (es->egl_surface)
         eglDestroySurface(es->egl_display, es->egl_surface);
     if (es->egl_context)
         eglDestroyContext(es->egl_display, es->egl_context);
-
     if (es->w_egl_window)
         wl_egl_window_destroy(es->w_egl_window);
 
-    if (es->decoration)
-        zxdg_toplevel_decoration_v1_destroy(es->decoration);
     if (es->wm_toplevel)
         xdg_toplevel_destroy(es->wm_toplevel);
     if (es->wm_surface)
         xdg_surface_destroy(es->wm_surface);
     if (es->surface)
         wl_surface_destroy(es->surface);
+
+    // The frame callback would destroy this but there is no guarantee it
+    // would ever be called so there is no point waiting
+    if (es->frame_callback)
+        wl_callback_destroy(es->frame_callback);
+
+    if (es->wm_base)
+        xdg_wm_base_destroy(es->wm_base);
+    if (es->decoration_manager)
+        zxdg_decoration_manager_v1_destroy(es->decoration_manager);
+    if (es->viewporter)
+        wp_viewporter_destroy(es->viewporter);
+    if (es->linux_dmabuf_v1)
+        zwp_linux_dmabuf_v1_destroy(es->linux_dmabuf_v1);
+    if (es->compositor)
+        wl_compositor_destroy(es->compositor);
+
+    wl_display_roundtrip(es->w_display);
 }
+
+// ---------------------------------------------------------------------------
+//
+// Wayland dispatcher
+//
+// Contains a flush in the pre-poll function so there is no need for one in
+// any callback
+
+// Pre display thread poll function
+static void
+pollq_pre_cb(void * v, struct pollfd * pfd)
+{
+    window_ctx_t * const wc = v;
+    struct wl_display *const display = wc->w_display;
+
+    while (wl_display_prepare_read(display) != 0)
+        wl_display_dispatch_pending(display);
+
+    if (wl_display_flush(display) >= 0)
+        pfd->events = POLLIN;
+    else
+        pfd->events = POLLOUT | POLLIN;
+    pfd->fd = wl_display_get_fd(display);
+}
+
+// Post display thread poll function
+// Happens before any other pollqueue callbacks
+// Dispatches wayland callbacks
+static void
+pollq_post_cb(void *v, short revents)
+{
+    window_ctx_t * const wc = v;
+    struct wl_display *const display = wc->w_display;
+
+    if ((revents & POLLIN) == 0)
+        wl_display_cancel_read(display);
+    else
+        wl_display_read_events(display);
+
+    wl_display_dispatch_pending(display);
+}
+
+// ---------------------------------------------------------------------------
+//
+// External entry points
 
 void
 egl_wayland_out_modeset(struct egl_wayland_out_env *dpo, int w, int h, AVRational frame_rate)
@@ -1015,58 +1079,6 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
 }
 
 
-
-static void
-pollq_pre_cb(void * v, struct pollfd * pfd)
-{
-    window_ctx_t * const wc = v;
-    struct wl_display *const display = wc->w_display;
-    int ferr;
-    int frv;
-
-//    fprintf(stderr, "Start Prepare\n");
-
-    while (wl_display_prepare_read(display) != 0) {
-        int n = wl_display_dispatch_pending(display);
-        (void)n;
-//        fprintf(stderr, "Dispatch=%d\n", n);
-    }
-    if ((frv = wl_display_flush(display)) >= 0) {
-        pfd->events = POLLIN;
-        ferr = 0;
-    }
-    else {
-        ferr = errno;
-        pfd->events = POLLOUT | POLLIN;
-    }
-    pfd->fd = wl_display_get_fd(display);
-(void)ferr;
-//    fprintf(stderr, "Done Prepare: fd=%d, evts=%#x, frv=%d, ferr=%s\n", pfd->fd, pfd->events, frv, ferr == 0 ? "ok" : strerror(ferr));
-}
-
-static void
-pollq_post_cb(void *v, short revents)
-{
-    window_ctx_t * const wc = v;
-    struct wl_display *const display = wc->w_display;
-    int n;
-
-    if ((revents & POLLIN) == 0) {
-//        fprintf(stderr, "Cancel read: Events=%#x: IN=%#x, OUT=%#x, ERR=%#x\n", (int)revents, POLLIN, POLLOUT, POLLERR);
-        wl_display_cancel_read(display);
-    }
-    else {
-//        fprintf(stderr, "Read events: Events=%#x: IN=%#x, OUT=%#x, ERR=%#x\n", (int)revents, POLLIN, POLLOUT, POLLERR);
-        wl_display_read_events(display);
-    }
-
-//    fprintf(stderr, "Start Dispatch\n");
-    n = wl_display_dispatch_pending(display);
-    (void)n;
-//    fprintf(stderr, "Dispatch=%d\n", n);
-}
-
-
 void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 {
     struct _escontext * const es = &de->wc;
@@ -1076,24 +1088,34 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 
     LOG("<<< %s\n", __func__);
 
-    pollqueue_unref(&es->pq);
+    if (es->surface)
+    {
+        wl_surface_attach(es->surface, NULL, 0, 0);
+        wl_surface_commit(es->surface);
+        wl_display_flush(es->w_display);
+    }
 
-    pthread_mutex_destroy(&de->q_lock);
-
-    av_frame_free(&de->q_next);
-
-    LOG(">>> %s\n", __func__);
+    pollqueue_finish(&es->pq);
 
     destroy_window(es);
     wl_display_disconnect(es->w_display);
     LOG("Display disconnected !\n");
+
+    av_frame_free(&de->q_next);
+    sem_destroy(&de->q_sem);
+    sem_destroy(&de->egl_setup_sem);
+    pthread_mutex_destroy(&de->q_lock);
+
+
+    LOG(">>> %s\n", __func__);
+
 
     free(de);
 }
 
 
 static struct egl_wayland_out_env*
-wayland_out_new(const bool is_egl, const bool fullscreen)
+wayland_out_new(const bool is_egl, const unsigned int flags)
 {
     struct egl_wayland_out_env * const de = calloc(1, sizeof(*de));
     struct _escontext * const es = &de->wc;
@@ -1101,9 +1123,8 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
     LOG("<<< %s\n", __func__);
 
     de->is_egl = is_egl;
-    de->show_all = true;
+    de->show_all = !(flags & WOUT_FLAG_NO_WAIT);
 
-    es->sig = ES_SIG;
     es->req_w = WINDOW_WIDTH;
     es->req_h = WINDOW_HEIGHT;
 
@@ -1152,17 +1173,18 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
     xdg_toplevel_set_title(es->wm_toplevel,
                            de->is_egl ? "EGL video" : "Dmabuf video");
 
-    if (fullscreen)
+    if ((flags & WOUT_FLAG_FULLSCREEN) != 0)
         xdg_toplevel_set_fullscreen(es->wm_toplevel, NULL);
 
     if (!es->decoration_manager) {
         LOG("No decoration manager\n");
     }
     else {
-        es->decoration =
+        struct zxdg_toplevel_decoration_v1 *decoration =
             zxdg_decoration_manager_v1_get_toplevel_decoration(es->decoration_manager, es->wm_toplevel);
-        zxdg_toplevel_decoration_v1_add_listener(es->decoration, &decoration_listener, es);
-        zxdg_toplevel_decoration_v1_set_mode(es->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        zxdg_toplevel_decoration_v1_add_listener(decoration, &decoration_listener, es);
+        zxdg_toplevel_decoration_v1_set_mode(decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        // decoration destroyed in the callback
     }
 
     {
@@ -1204,13 +1226,13 @@ fail:
     return NULL;
 }
 
-struct egl_wayland_out_env* egl_wayland_out_new(bool fullscreen)
+struct egl_wayland_out_env* egl_wayland_out_new(unsigned int flags)
 {
-    return wayland_out_new(true, fullscreen);
+    return wayland_out_new(true, flags);
 }
 
-struct egl_wayland_out_env* dmabuf_wayland_out_new(bool fullscreen)
+struct egl_wayland_out_env* dmabuf_wayland_out_new(unsigned int flags)
 {
-    return wayland_out_new(false, fullscreen);
+    return wayland_out_new(false, flags);
 }
 

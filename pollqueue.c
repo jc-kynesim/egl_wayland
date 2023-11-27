@@ -61,6 +61,7 @@ struct pollqueue {
     } prepost;
 
     bool kill;
+    bool join_req;  // On thread exit do not detach
     bool no_prod;
 
     bool sig_seq; // Signal cond when seq incremented
@@ -383,6 +384,8 @@ fail_unlocked:
     pthread_cond_destroy(&pq->cond);
     pthread_mutex_destroy(&pq->lock);
     close(pq->prod_fd);
+    if (!pq->join_req)
+        pthread_detach(pthread_self());
     free(pq);
 
     return NULL;
@@ -441,16 +444,18 @@ static void pollqueue_free(struct pollqueue *const pq)
 
     if (pthread_equal(worker, pthread_self())) {
         pq->kill = true;
-        pollqueue_prod(pq);
-        pthread_detach(worker);
+        if (!pq->no_prod)
+            pollqueue_prod(pq);
     }
     else
     {
         pthread_mutex_lock(&pq->lock);
         pq->kill = true;
-        pollqueue_prod(pq);
+        // Must prod inside lock here as otherwise there is a potential race
+        // where the worker terminates and pq is freed before the prod
+        if (!pq->no_prod)
+            pollqueue_prod(pq);
         pthread_mutex_unlock(&pq->lock);
-        pthread_join(worker, NULL);
     }
 }
 
@@ -472,6 +477,22 @@ void pollqueue_unref(struct pollqueue **const ppq)
         return;
 
     pollqueue_free(pq);
+}
+
+void pollqueue_finish(struct pollqueue **const ppq)
+{
+    struct pollqueue * const pq = *ppq;
+    pthread_t worker;
+
+    if (!pq)
+        return;
+
+    pq->join_req = true;
+    worker = pq->worker;
+
+    pollqueue_unref(ppq);
+
+    pthread_join(worker, NULL);
 }
 
 void pollqueue_set_pre_post(struct pollqueue *const pq,

@@ -55,10 +55,13 @@ struct pollqueue * pollqueue_new(void);
 
 // Unref a pollqueue
 // Will be deleted once all polltasks (Qed or otherwise) are deleted too
-// If called from outside the polltask thread and this causes the pollqueue
-// to be deleted then it will wait for the polltask thread to terminate
-// before returning.
+// Will not wait for polltask termination whether or not this is the last
+// ref.
 void pollqueue_unref(struct pollqueue **const ppq);
+
+// Unrefs a pollqueue and then waits for the polltask thread to terminate
+// before returning.
+void pollqueue_finish(struct pollqueue **const ppq);
 
 // Add a reference to a pollqueue
 struct pollqueue * pollqueue_ref(struct pollqueue *const pq);

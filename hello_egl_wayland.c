@@ -303,8 +303,10 @@ void usage()
             "Usage: hello_egl_wayland [-d]\n"
             "                      [-l loop_count] [-f <frames>] [-o yuv_output_file]\n"
             "                      [--deinterlace] [--pace-input <hz>] [--fullscreen]\n"
-            "                      <input file> [<input_file> ...]\n"
-            " -d   Use dmabuf (otherwise egl)\n");
+            "                      [--no-wait]\n"
+            "                      <input file> [<input_file> ...]\n\n"
+            " -d   Use dmabuf (otherwise egl)\n"
+            " --no-wait Decode at max speed, do not wait for display\n");
     exit(1);
 }
 
@@ -335,6 +337,7 @@ int main(int argc, char *argv[])
     long pace_input_hz = 0;
     bool use_dmabuf = false;
     bool fullscreen = false;
+    bool no_wait = false;
 
     {
         char * const * a = argv + 1;
@@ -394,6 +397,9 @@ int main(int argc, char *argv[])
             else if (strcmp(arg, "--deinterlace") == 0) {
                 wants_deinterlace = true;
             }
+            else if (strcmp(arg, "--no-wait") == 0) {
+                no_wait = true;
+            }
             else if (strcmp(arg, "--") == 0) {
                 --n;  // If we are going to break out then need to dec count like in the while
                 break;
@@ -421,10 +427,15 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    dpo = use_dmabuf ? dmabuf_wayland_out_new(fullscreen) : egl_wayland_out_new(fullscreen);
-    if (dpo == NULL) {
-        fprintf(stderr, "Failed to open egl_wayland output\n");
-        return 1;
+    {
+        unsigned int flags =
+            (fullscreen ? WOUT_FLAG_FULLSCREEN : 0) |
+            (no_wait ? WOUT_FLAG_NO_WAIT : 0);
+        dpo = use_dmabuf ? dmabuf_wayland_out_new(flags) : egl_wayland_out_new(flags);
+        if (dpo == NULL) {
+            fprintf(stderr, "Failed to open egl_wayland output\n");
+            return 1;
+        }
     }
 
     /* open the file to dump raw data */
