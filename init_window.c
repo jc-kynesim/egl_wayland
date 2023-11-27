@@ -1,54 +1,43 @@
-// gcc -o test init_window.c -I. -lwayland-client -lwayland-server -lwayland-client-protocol -lwayland-egl -lEGL -lGLESv2
-#include <wayland-client-core.h>
-#include <wayland-client.h>
-#include <wayland-server.h>
-#include <wayland-client-protocol.h>
-#include <wayland-egl.h> // Wayland EGL MUST be included before EGL headers
-
-#include "viewporter-client-protocol.h"
-#include "xdg-shell-client-protocol.h"
-#include "xdg-decoration-unstable-v1-client-protocol.h"
-#include "linux-dmabuf-unstable-v1-client-protocol.h"
-
-#include "init_window.h"
-//#include "log.h"
-#define LOG printf
-
 #include <assert.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
 #include <unistd.h>
 
-#include <math.h>
-
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/poll.h>
-#include <sys/time.h>
+#include <wayland-client-protocol.h>
+#include <wayland-egl.h> // Wayland EGL MUST be included before EGL headers
 
 #include <epoxy/gl.h>
 #include <epoxy/egl.h>
 
-#include <pthread.h>
-#include <semaphore.h>
+#include <libdrm/drm_fourcc.h>
 
-#include "libavutil/frame.h"
-#include "libavcodec/avcodec.h"
-#include "libavutil/hwcontext.h"
-#include "libavutil/hwcontext_drm.h"
+#include <libavutil/frame.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 
+// protocol headers that we build as part of the compile
+#include "viewporter-client-protocol.h"
+#include "linux-dmabuf-unstable-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
+
+// Local headers
+#include "init_window.h"
 #include "pollqueue.h"
+
+//#include "log.h"
+#define LOG printf
 
 #define TRACE_ALL 1
 #define  DEBUG_SOLID 0
 
 #define ES_SIG 0x12345678
-
-#define W_SUBSURFACE 0
 
 typedef struct _escontext
 {
@@ -60,10 +49,7 @@ typedef struct _escontext
     struct wl_egl_window *native_window;
     struct wl_compositor *w_compositor;
     struct wl_surface *w_surface;
-    struct wl_surface *w_surface2;
-    struct wl_subsurface *w_subsurface2;
     struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1_bind;
-    struct wl_shm *w_shm;
     struct wl_subcompositor *w_subcompositor;
     struct zxdg_decoration_manager_v1 *x_decoration;
     struct wp_viewporter *w_viewporter;
@@ -82,74 +68,65 @@ typedef struct _escontext
     unsigned int sig;
 } window_ctx_t;
 
-typedef struct egl_aux_s
-{
-    int fd;
-    GLuint texture;
-} egl_aux_t;
-
 struct egl_wayland_out_env
 {
     window_ctx_t wc;
 
-    enum AVPixelFormat avfmt;
-
     int show_all;
-    int window_width, window_height;
-    int window_x, window_y;
     int fullscreen;
 
-    egl_aux_t aux[32];
-
-
-    pthread_t q_thread;
     pthread_mutex_t q_lock;
     sem_t display_start_sem;
     sem_t q_sem;
-    int prod_fd;
     int q_terminate;
     bool is_egl;
-    AVFrame *q_this;
+
     AVFrame *q_next;
+    bool frame_wait;
 };
 
-#define TRUE 1
-#define FALSE 0
-
-#define WINDOW_WIDTH 1280
-#define WINDOW_HEIGHT 720
-
-
-
-static int
-check_support(const struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
-{
-    EGLuint64KHR mods[16];
-    GLint mod_count = 0;
-    GLint i;
-
-    if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
-    {
-        LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
-        return 0;
-    }
-
-    for (i = 0; i < mod_count; ++i)
-    {
-        if (mods[i] == mod)
-            return 1;
-    }
-
-    LOG("Failed to find modifier %"PRIx64"\n", mod);
-    return 0;
-}
-
+// Structure that holds context whilst waiting for fence release
 struct dmabuf_w_env_s {
     AVBufferRef * buf;
     struct pollqueue * pq;
     struct polltask * pt;
     struct _escontext * es;
 };
+
+
+#define WINDOW_WIDTH 1280
+#define WINDOW_HEIGHT 720
+
+
+// Remove any params from a modifier
+static inline uint64_t canon_mod(const uint64_t m)
+{
+    return fourcc_mod_is_vendor(m, BROADCOM) ? fourcc_mod_broadcom_mod(m) : m;
+}
+
+static bool
+check_support_egl(const struct _escontext *const es, const uint32_t fmt, const uint64_t mod)
+{
+    EGLuint64KHR mods[16];
+    GLint mod_count = 0;
+    GLint i;
+    const uint64_t cmod = canon_mod(mod);
+
+    if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
+    {
+        LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
+        return false;
+    }
+
+    for (i = 0; i < mod_count; ++i)
+    {
+        if (mods[i] == cmod)
+            return true;
+    }
+
+    LOG("Failed to find modifier %"PRIx64"\n", cmod);
+    return false;
+}
 
 static struct dmabuf_w_env_s *
 dmabuf_w_env_new(struct _escontext *const es, AVBufferRef * const buf)
@@ -288,26 +265,34 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
     return NULL;
 }
 
-static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const es, AVFrame *const frame)
+static void
+do_display_egl(struct _escontext *const es, AVFrame *const frame)
 {
-#if DEBUG_SOLID
-    (void)de;
-    (void)frame;
-    static double a = 0.3;
-
-    glClearColor(0.5, a, 0.0, 1.0);
-
-    a += 0.05;
-    if (a >= 1.0)
-        a = 0.0;
-
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    eglSwapBuffers(es->display, es->surface);
-#else
     const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)frame->data[0];
-    egl_aux_t *da = NULL;
-    unsigned int i;
+    EGLint attribs[50];
+    EGLint *a = attribs;
+    int i, j;
+    GLuint texture;
+    EGLImage image;
+
+    static const EGLint anames[] = {
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+        EGL_DMA_BUF_PLANE1_FD_EXT,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+        EGL_DMA_BUF_PLANE1_PITCH_EXT,
+        EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+        EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
+        EGL_DMA_BUF_PLANE2_FD_EXT,
+        EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+        EGL_DMA_BUF_PLANE2_PITCH_EXT,
+        EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+        EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
+    };
+    const EGLint *b = anames;
 
 #if TRACE_ALL
     LOG("<<< %s\n", __func__);
@@ -318,10 +303,10 @@ static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const 
         if (!z)
         {
             z = 1;
-            if (!check_support(es, desc->layers[0].format, desc->objects[0].format_modifier))
+            if (!check_support_egl(es, desc->layers[0].format, desc->objects[0].format_modifier))
             {
                 LOG("No support for format\n");
-                return -1;
+                return;
             }
         }
     }
@@ -333,146 +318,71 @@ static int do_display(egl_wayland_out_env_t *const de, struct _escontext *const 
         es->window_height = es->req_h;
     }
 
-    for (i = 0; i != 32; ++i)
+    *a++ = EGL_WIDTH;
+    *a++ = av_frame_cropped_width(frame);
+    *a++ = EGL_HEIGHT;
+    *a++ = av_frame_cropped_height(frame);
+    *a++ = EGL_LINUX_DRM_FOURCC_EXT;
+    *a++ = desc->layers[0].format;
+
+    for (i = 0; i < desc->nb_layers; ++i)
     {
-        if (de->aux[i].fd == -1 || de->aux[i].fd == desc->objects[0].fd)
+        for (j = 0; j < desc->layers[i].nb_planes; ++j)
         {
-            da = de->aux + i;
-            break;
-        }
-    }
-
-    if (da == NULL)
-    {
-        LOG("%s: Out of handles\n", __func__);
-        return AVERROR(EINVAL);
-    }
-
-    if (da->texture == 0)
-    {
-        EGLint attribs[50];
-        EGLint *a = attribs;
-        int i, j;
-        static const EGLint anames[] = {
-            EGL_DMA_BUF_PLANE0_FD_EXT,
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT,
-            EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
-            EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-            EGL_DMA_BUF_PLANE1_FD_EXT,
-            EGL_DMA_BUF_PLANE1_OFFSET_EXT,
-            EGL_DMA_BUF_PLANE1_PITCH_EXT,
-            EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
-            EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
-            EGL_DMA_BUF_PLANE2_FD_EXT,
-            EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-            EGL_DMA_BUF_PLANE2_PITCH_EXT,
-            EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
-            EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-        };
-        const EGLint *b = anames;
-
-        *a++ = EGL_WIDTH;
-        *a++ = av_frame_cropped_width(frame);
-        *a++ = EGL_HEIGHT;
-        *a++ = av_frame_cropped_height(frame);
-        *a++ = EGL_LINUX_DRM_FOURCC_EXT;
-        *a++ = desc->layers[0].format;
-
-        for (i = 0; i < desc->nb_layers; ++i)
-        {
-            for (j = 0; j < desc->layers[i].nb_planes; ++j)
+            const AVDRMPlaneDescriptor *const p = desc->layers[i].planes + j;
+            const AVDRMObjectDescriptor *const obj = desc->objects + p->object_index;
+            *a++ = *b++;
+            *a++ = obj->fd;
+            *a++ = *b++;
+            *a++ = p->offset;
+            *a++ = *b++;
+            *a++ = p->pitch;
+            if (obj->format_modifier == 0)
             {
-                const AVDRMPlaneDescriptor *const p = desc->layers[i].planes + j;
-                const AVDRMObjectDescriptor *const obj = desc->objects + p->object_index;
+                b += 2;
+            }
+            else
+            {
                 *a++ = *b++;
-                *a++ = obj->fd;
+                *a++ = (EGLint)(obj->format_modifier & 0xFFFFFFFF);
                 *a++ = *b++;
-                *a++ = p->offset;
-                *a++ = *b++;
-                *a++ = p->pitch;
-                if (obj->format_modifier == 0)
-                {
-                    b += 2;
-                }
-                else
-                {
-                    *a++ = *b++;
-                    *a++ = (EGLint)(obj->format_modifier & 0xFFFFFFFF);
-                    *a++ = *b++;
-                    *a++ = (EGLint)(obj->format_modifier >> 32);
-                }
+                *a++ = (EGLint)(obj->format_modifier >> 32);
             }
         }
-
-        *a = EGL_NONE;
-
-#if TRACE_ALL
-        for (a = attribs, i = 0; *a != EGL_NONE; a += 2, ++i)
-        {
-            LOG("[%2d] %4x: %d\n", i, a[0], a[1]);
-        }
-#endif
-        {
-            const EGLImage image = eglCreateImageKHR(es->display,
-                                                     EGL_NO_CONTEXT,
-                                                     EGL_LINUX_DMA_BUF_EXT,
-                                                     NULL, attribs);
-            if (!image)
-            {
-                LOG("Failed to import fd %d\n", desc->objects[0].fd);
-                return -1;
-            }
-
-            glGenTextures(1, &da->texture);
-            glBindTexture(GL_TEXTURE_EXTERNAL_OES, da->texture);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
-
-            eglDestroyImageKHR(es->display, image);
-        }
-
-        da->fd = desc->objects[0].fd;
-
-#if 0
-        LOG( "%dx%d, fmt: %x, boh=%d,%d,%d,%d, pitch=%d,%d,%d,%d,"
-            " offset=%d,%d,%d,%d, mod=%llx,%llx,%llx,%llx\n",
-            av_frame_cropped_width(frame),
-            av_frame_cropped_height(frame),
-            desc->layers[0].format,
-            bo_plane_handles[0],
-            bo_plane_handles[1],
-            bo_plane_handles[2],
-            bo_plane_handles[3],
-            pitches[0],
-            pitches[1],
-            pitches[2],
-            pitches[3],
-            offsets[0],
-            offsets[1],
-            offsets[2],
-            offsets[3],
-            (long long)modifiers[0],
-            (long long)modifiers[1],
-            (long long)modifiers[2],
-            (long long)modifiers[3]
-           );
-#endif
     }
+    *a = EGL_NONE;
+
+    if (!(image = eglCreateImageKHR(es->display, EGL_NO_CONTEXT,
+                                    EGL_LINUX_DMA_BUF_EXT, NULL, attribs)))
+    {
+        LOG("Failed to import fd %d\n", desc->objects[0].fd);
+        return;
+    }
+
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
+
+    eglDestroyImageKHR(es->display, image);
 
     glClearColor(0.5, 0.5, 0.5, 0.5);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, da->texture);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
     eglSwapBuffers(es->display, es->surface);
 
-    glDeleteTextures(1, &da->texture);
-    da->texture = 0;
-    da->fd = -1;
-#endif
-    return 0;
+    glDeleteTextures(1, &texture);
+
+    // A fence is set on the fd by the egl render - we can reuse the buffer once it goes away
+    // (same as the direct wayland output after buffer release)
+    {
+        struct dmabuf_w_env_s * const dbe = dmabuf_w_env_new(es, frame->buf[0]);
+        dbe->pt = polltask_new(dbe->pq, desc->objects[0].fd, POLLOUT, dmabuf_fence_release_cb, dbe);
+        pollqueue_add_task(dbe->pt, -1);
+    }
 }
 
 
@@ -598,7 +508,8 @@ gl_setup()
     return 0;
 }
 
-EGLBoolean CreateEGLContext(struct _escontext * const es)
+static EGLBoolean
+CreateEGLContext(struct _escontext * const es)
 {
     EGLint numConfigs;
     EGLint majorVersion;
@@ -737,13 +648,35 @@ fail:
     sem_post(&de->display_start_sem);
 }
 
+static void try_display(struct egl_wayland_out_env * const de);
+
+static void
+surface_frame_done_cb(void * data, struct wl_callback *cb, uint32_t time)
+{
+    struct egl_wayland_out_env * const de = data;
+    (void)time;
+
+    wl_callback_destroy(cb);
+
+    de->frame_wait = false;
+    try_display(de);
+}
+
 static void
 do_prod_display(void * v, short revents)
 {
-    struct egl_wayland_out_env * const de = v;
-    window_ctx_t * const wc = &de->wc;
     (void)revents;
+    try_display(v);
+}
+
+static void
+try_display(struct egl_wayland_out_env * const de)
+{
+    window_ctx_t * const wc = &de->wc;
     AVFrame * frame;
+
+    if (de->frame_wait)
+        return;
 
     pthread_mutex_lock(&de->q_lock);
     frame = de->q_next;
@@ -752,14 +685,19 @@ do_prod_display(void * v, short revents)
 
     if (frame)
     {
+        static const struct wl_callback_listener frame_listener = {.done = surface_frame_done_cb};
+        struct wl_callback * cb = wl_surface_frame(wc->w_surface);
+        wl_callback_add_listener(cb, &frame_listener, de);
+        de->frame_wait = true;
+
         if (de->is_egl)
-            do_display(de, wc, frame);
+            do_display_egl(wc, frame);
         else
             do_display_dmabuf(wc, frame);
-        av_frame_free(&de->q_this);
-        de->q_this = frame;
+        av_frame_free(&frame);
     }
 }
+
 
 static void xdg_toplevel_handle_configure(void *data,
     struct xdg_toplevel *xdg_toplevel, int32_t w, int32_t h,
@@ -865,7 +803,7 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
     sem_post(&de->display_start_sem);  //***********
 }
 
-const struct xdg_surface_listener xdg_surface_listener = {
+static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_surface_configure,
 };
 
@@ -876,7 +814,7 @@ static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base,
     xdg_wm_base_pong(xdg_wm_base, serial);
 }
 
-const struct xdg_wm_base_listener xdg_wm_base_listener = {
+static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping,
 };
 
@@ -937,8 +875,6 @@ static void global_registry_handler(void *data, struct wl_registry *registry, ui
         es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 1);
         zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1_bind, &linux_dmabuf_v1_listener, es);
     }
-    if (strcmp(interface, wl_shm_interface.name) == 0)
-        es->w_shm = wl_registry_bind(registry, id, &wl_shm_interface, 1);
     if (strcmp(interface, wl_subcompositor_interface.name) == 0)
         es->w_subcompositor = wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
     if (strcmp(interface, xdg_wm_base_interface.name) == 0)
@@ -1156,7 +1092,6 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
     pthread_mutex_destroy(&de->q_lock);
 
     av_frame_free(&de->q_next);
-    av_frame_free(&de->q_this);
 
     LOG(">>> %s\n", __func__);
 
@@ -1172,13 +1107,13 @@ static struct egl_wayland_out_env*
 wayland_out_new(const bool is_egl, const bool fullscreen)
 {
     struct egl_wayland_out_env * const de = calloc(1, sizeof(*de));
-    unsigned int i;
     struct _escontext * const es = &de->wc;
 
     LOG("<<< %s\n", __func__);
 
     de->q_terminate = 0;
     de->is_egl = is_egl;
+    de->show_all = true;
 
     es->sig = ES_SIG;
     es->req_w = WINDOW_WIDTH;
@@ -1220,17 +1155,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
         zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
     }
 
-#if W_SUBSURFACE
-    es->w_surface2 = wl_compositor_create_surface(es->w_compositor);
-    es->w_subsurface2 = wl_subcompositor_get_subsurface(es->w_subcompositor, es->w_surface2, es->w_surface);
-    wl_subsurface_set_position(es->w_subsurface2, -20, -20);
-    wl_subsurface_place_above(es->w_subsurface2, es->w_surface);
-    wl_subsurface_set_sync(es->w_subsurface2);
-
-    wl_surface_attach(es->w_surface2, draw_frame(es), 0, 0);
-    wl_surface_commit(es->w_surface2);
-#endif
-
     {
         struct wl_region * const region = wl_compositor_create_region(es->w_compositor);
 
@@ -1250,11 +1174,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
     pollqueue_set_pre_post(es->pq, pollq_pre_cb, pollq_post_cb, es);
 
     LOG("<<< %s\n", __func__);
-
-    for (i = 0; i != 32; ++i)
-    {
-        de->aux[i].fd = -1;
-    }
 
     // Some egl setup must be done on display thread
     if (de->is_egl)

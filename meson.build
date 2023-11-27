@@ -10,6 +10,7 @@ wl_client_dep = dependency('wayland-client')
 wl_protocol_dep = dependency('wayland-protocols')
 wl_egl_dep = dependency('wayland-egl')
 epoxy_dep = dependency('epoxy')
+libdrm_dep = dependency('libdrm')
 threads_dep = dependency('threads')
 
 wl_scanner = find_program('wayland-scanner')
@@ -58,7 +59,7 @@ dep_rt = meson.get_compiler('c').find_library('rt')
 executable('hello_egl_wayland',
   wl_sources + protocols_files,
   install : true,
-  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep,
+  dependencies : [wl_client_dep, wl_protocol_dep, wl_egl_dep, epoxy_dep, libdrm_dep,
     threads_dep,
     dep_rt,
     dependency('libavcodec'),
