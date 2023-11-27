@@ -686,7 +686,7 @@ try_display(struct egl_wayland_out_env * const de)
 
 // ---------------------------------------------------------------------------
 //
-// Toplevel callbacks
+// XDG Toplevel callbacks
 
 static void xdg_toplevel_configure_cb(void *data,
     struct xdg_toplevel *xdg_toplevel, int32_t w, int32_t h,
@@ -781,12 +781,17 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
 
     LOG("%s\n", __func__);
     // confirm that you exist to the compositor
+
+#note Reset viewport here?
+
     xdg_surface_ack_configure(xdg_surface, serial);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = xdg_surface_configure,
 };
+
+// ---------------------------------------------------------------------------
 
 static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base,
                              uint32_t serial)
@@ -798,6 +803,8 @@ static void xdg_wm_base_ping(void *data, struct xdg_wm_base *xdg_wm_base,
 static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping,
 };
+
+// ---------------------------------------------------------------------------
 
 static void linux_dmabuf_v1_listener_format(void *data,
                struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1,
@@ -828,19 +835,23 @@ static const struct zwp_linux_dmabuf_v1_listener linux_dmabuf_v1_listener = {
     .modifier = linux_dmabuf_v1_listener_modifier,
 };
 
+// ---------------------------------------------------------------------------
+
 static void
-decoration_configure(void *data,
+decoration_configure_cb(void *data,
               struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1,
               uint32_t mode)
 {
     (void)data;
-    printf("%s[%p]: mode %d\n", __func__, (void*)zxdg_toplevel_decoration_v1, mode);
+    LOG("%s: mode %d\n", __func__, mode);
     zxdg_toplevel_decoration_v1_destroy(zxdg_toplevel_decoration_v1);
 }
 
 static struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
-    .configure = decoration_configure,
+    .configure = decoration_configure_cb,
 };
+
+// ---------------------------------------------------------------------------
 
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id,
                                     const char *interface, uint32_t version)
