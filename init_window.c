@@ -35,38 +35,40 @@
 #define LOG printf
 
 #define TRACE_ALL 1
-#define  DEBUG_SOLID 0
 
 #define ES_SIG 0x12345678
 
 typedef struct _escontext
 {
-    struct wl_display *native_display;
+    struct wl_display *w_display;
     int window_width;
     int window_height;
     int req_w;
     int req_h;
-    struct wl_egl_window *native_window;
-    struct wl_compositor *w_compositor;
-    struct wl_surface *w_surface;
-    struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1_bind;
-    struct wl_subcompositor *w_subcompositor;
-    struct zxdg_decoration_manager_v1 *x_decoration;
-    struct wp_viewporter *w_viewporter;
-    struct wp_viewport *w_viewport;
+    struct pollqueue *pq;
 
-    struct xdg_wm_base *XDGWMBase;
-    struct xdg_surface *XDGSurface;
-    struct xdg_toplevel *XDGToplevel;
+    // Bound wayland extensions
+    struct wl_compositor *compositor;
+    struct zwp_linux_dmabuf_v1 * linux_dmabuf_v1;
+    struct zxdg_decoration_manager_v1 *decoration_manager;
+    struct wp_viewporter *viewporter;
+    struct xdg_wm_base *wm_base;
 
-    EGLDisplay display;
-    EGLContext context;
-    EGLSurface surface;
+    // Wayland objects
+    struct wl_surface *surface;
+    struct zxdg_toplevel_decoration_v1 *decoration;
+    struct wp_viewport *viewport;
+    struct xdg_surface *wm_surface;
+    struct xdg_toplevel *wm_toplevel;
+
+    // EGL
+    struct wl_egl_window *w_egl_window;
+    EGLDisplay egl_display;
+    EGLContext egl_context;
+    EGLSurface egl_surface;
     bool fmt_ok;
     uint32_t last_fmt;
     uint64_t last_mod;
-
-    struct pollqueue *pq;
 
     unsigned int sig;
 } window_ctx_t;
@@ -79,12 +81,13 @@ struct egl_wayland_out_env
     int fullscreen;
 
     pthread_mutex_t q_lock;
-    sem_t display_start_sem;
-    sem_t q_sem;
-    int q_terminate;
+    sem_t egl_setup_sem;
+    bool egl_setup_fail;
     bool is_egl;
 
+    sem_t q_sem;
     AVFrame *q_next;
+
     bool frame_wait;
 };
 
@@ -178,7 +181,7 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
     LOG("<<< %s\n", __func__);
 
     /* Creation and configuration of planes  */
-    params = zwp_linux_dmabuf_v1_create_params(es->linux_dmabuf_v1_bind);
+    params = zwp_linux_dmabuf_v1_create_params(es->linux_dmabuf_v1);
     if (!params)
     {
         LOG("zwp_linux_dmabuf_v1_create_params FAILED\n");
@@ -221,10 +224,10 @@ do_display_dmabuf(struct _escontext *const es, AVFrame * const frame)
     wl_buffer_add_listener(w_buffer, &w_buffer_listener,
                            dmabuf_w_env_new(es, frame->buf[0]));
 
-    wl_surface_attach(es->w_surface, w_buffer, 0, 0);
-    wp_viewport_set_destination(es->w_viewport, es->req_w, es->req_h);
-    wl_surface_damage(es->w_surface, 0, 0, INT32_MAX, INT32_MAX);
-    wl_surface_commit(es->w_surface);
+    wl_surface_attach(es->surface, w_buffer, 0, 0);
+    wp_viewport_set_destination(es->viewport, es->req_w, es->req_h);
+    wl_surface_damage(es->surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(es->surface);
     return NULL;
 }
 
@@ -247,7 +250,7 @@ check_support_egl(struct _escontext *const es, const uint32_t fmt, const uint64_
     es->last_mod = cmod;
     es->fmt_ok = false;
 
-    if (!eglQueryDmaBufModifiersEXT(es->display, fmt, 16, mods, NULL, &mod_count))
+    if (!eglQueryDmaBufModifiersEXT(es->egl_display, fmt, 16, mods, NULL, &mod_count))
     {
         LOG("queryDmaBufModifiersEXT Failed for %s\n", av_fourcc2str(fmt));
         return false;
@@ -307,7 +310,7 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
 
     if (es->req_w != es->window_width || es->req_h != es->window_height) {
         LOG("%s: Resize %dx%d -> %dx%d\n", __func__, es->window_width, es->window_height, es->req_w, es->req_h);
-        wl_egl_window_resize(es->native_window, es->req_w, es->req_h, 0, 0);
+        wl_egl_window_resize(es->w_egl_window, es->req_w, es->req_h, 0, 0);
         es->window_width = es->req_w;
         es->window_height = es->req_h;
     }
@@ -346,7 +349,7 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
     }
     *a = EGL_NONE;
 
-    if (!(image = eglCreateImageKHR(es->display, EGL_NO_CONTEXT,
+    if (!(image = eglCreateImageKHR(es->egl_display, EGL_NO_CONTEXT,
                                     EGL_LINUX_DMA_BUF_EXT, NULL, attribs)))
     {
         LOG("Failed to import fd %d\n", desc->objects[0].fd);
@@ -359,11 +362,11 @@ do_display_egl(struct _escontext *const es, AVFrame *const frame)
     glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image);
 
-    eglDestroyImageKHR(es->display, image);
+    eglDestroyImageKHR(es->egl_display, image);
 
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
-    eglSwapBuffers(es->display, es->surface);
+    eglSwapBuffers(es->egl_display, es->egl_surface);
 
     glDeleteTextures(1, &texture);
 
@@ -523,7 +526,7 @@ CreateEGLContext(struct _escontext * const es)
         EGL_NONE
     };
     EGLint contextAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE, EGL_NONE };
-    EGLDisplay display = eglGetDisplay(es->native_display);
+    EGLDisplay display = eglGetDisplay(es->w_display);
     if (display == EGL_NO_DISPLAY)
     {
         LOG("No EGL Display...\n");
@@ -556,17 +559,17 @@ CreateEGLContext(struct _escontext * const es)
         return EGL_FALSE;
     }
 
-    es->native_window =
-        wl_egl_window_create(es->w_surface, es->window_width, es->window_height);
+    es->w_egl_window =
+        wl_egl_window_create(es->surface, es->window_width, es->window_height);
 
-    if (es->native_window == EGL_NO_SURFACE)
+    if (es->w_egl_window == EGL_NO_SURFACE)
     {
         LOG("No window !?\n");
         return EGL_FALSE;
     }
 
     // Create a surface
-    surface = eglCreateWindowSurface(display, config, es->native_window, NULL);
+    surface = eglCreateWindowSurface(display, config, es->w_egl_window, NULL);
     if (surface == EGL_NO_SURFACE)
     {
         LOG("No surface...\n");
@@ -581,9 +584,9 @@ CreateEGLContext(struct _escontext * const es)
         return EGL_FALSE;
     }
 
-    es->display = display;
-    es->surface = surface;
-    es->context = context;
+    es->egl_display = display;
+    es->egl_surface = surface;
+    es->egl_context = context;
     return EGL_TRUE;
 }
 
@@ -598,7 +601,7 @@ do_egl_setup(void * v, short revents)
         goto fail;
 
     // Make the context current
-    if (!eglMakeCurrent(wc->display, wc->surface, wc->surface, wc->context))
+    if (!eglMakeCurrent(wc->egl_display, wc->egl_surface, wc->egl_surface, wc->egl_context))
     {
         LOG("Could not make the current window current !\n");
         goto fail;
@@ -608,9 +611,9 @@ do_egl_setup(void * v, short revents)
     LOG("GL Version: %s\n", glGetString(GL_VERSION));
     LOG("GL Renderer: %s\n", glGetString(GL_RENDERER));
     LOG("GL Extensions: %s\n", glGetString(GL_EXTENSIONS));
-    LOG("EGL Extensions: %s\n", eglQueryString(wc->display, EGL_EXTENSIONS));
+    LOG("EGL Extensions: %s\n", eglQueryString(wc->egl_display, EGL_EXTENSIONS));
 
-    if (!epoxy_has_egl_extension(wc->display, "EGL_EXT_image_dma_buf_import"))
+    if (!epoxy_has_egl_extension(wc->egl_display, "EGL_EXT_image_dma_buf_import"))
     {
         LOG("Missing EGL EXT image dma_buf extension\n");
         goto fail;
@@ -621,11 +624,12 @@ do_egl_setup(void * v, short revents)
         LOG("%s: gl_setup failed\n", __func__);
         goto fail;
     }
+    sem_post(&de->egl_setup_sem);
     return;
 
 fail:
-    de->q_terminate = 1;
-    sem_post(&de->display_start_sem);
+    de->egl_setup_fail = true;
+    sem_post(&de->egl_setup_sem);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,9 +672,11 @@ try_display(struct egl_wayland_out_env * const de)
     if (frame)
     {
         static const struct wl_callback_listener frame_listener = {.done = surface_frame_done_cb};
-        struct wl_callback * cb = wl_surface_frame(wc->w_surface);
+        struct wl_callback * cb = wl_surface_frame(wc->surface);
         wl_callback_add_listener(cb, &frame_listener, de);
         de->frame_wait = true;
+        if (de->show_all)
+            sem_post(&de->q_sem);
 
         if (de->is_egl)
             do_display_egl(wc, frame);
@@ -680,8 +686,11 @@ try_display(struct egl_wayland_out_env * const de)
     }
 }
 
+// ---------------------------------------------------------------------------
+//
+// Toplevel callbacks
 
-static void xdg_toplevel_handle_configure(void *data,
+static void xdg_toplevel_configure_cb(void *data,
     struct xdg_toplevel *xdg_toplevel, int32_t w, int32_t h,
     struct wl_array *states)
 {
@@ -703,8 +712,7 @@ static void xdg_toplevel_handle_configure(void *data,
     es->req_w = w;
 }
 
-static void xdg_toplevel_handle_close(void *data,
-                                      struct xdg_toplevel *xdg_toplevel)
+static void xdg_toplevel_close_cb(void *data, struct xdg_toplevel *xdg_toplevel)
 {
     (void)data;
     (void)xdg_toplevel;
@@ -760,29 +768,22 @@ static void xdg_toplevel_wm_capabilities_cb(void *data,
 }
 
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
-    .configure = xdg_toplevel_handle_configure,
-    .close = xdg_toplevel_handle_close,
+    .configure = xdg_toplevel_configure_cb,
+    .close = xdg_toplevel_close_cb,
     .configure_bounds = xdg_toplevel_configure_bounds_cb,
     .wm_capabilities = xdg_toplevel_wm_capabilities_cb,
 };
 
+// ---------------------------------------------------------------------------
 
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
                                   uint32_t serial)
 {
-    struct egl_wayland_out_env * const de = data;
-//  struct _escontext *const es = de->es;
+    (void)data;
+
     LOG("%s\n", __func__);
     // confirm that you exist to the compositor
     xdg_surface_ack_configure(xdg_surface, serial);
-
-    // ********************
-//  struct wl_buffer *buffer = draw_frame(es);
-//  wl_surface_attach(es->w_surface, buffer, 0, 0);
-//  wl_surface_commit(es->w_surface);
-    // ********************
-
-    sem_post(&de->display_start_sem);  //***********
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -846,30 +847,32 @@ static struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
 static void global_registry_handler(void *data, struct wl_registry *registry, uint32_t id,
                                     const char *interface, uint32_t version)
 {
-    struct _escontext * const es = data;
+    struct egl_wayland_out_env * const de = data;
+    struct _escontext * const es = &de->wc;
     (void)version;
 
     LOG("Got a registry event for %s id %d\n", interface, id);
 
     if (strcmp(interface, wl_compositor_interface.name) == 0)
-        es->w_compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+        es->compositor = wl_registry_bind(registry, id, &wl_compositor_interface, 4);
+
     // Want version 2 as that has _create_immed which is much easier to use
     // than the previous callbacks
-    if (strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
-        es->linux_dmabuf_v1_bind = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 2);
-        zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1_bind, &linux_dmabuf_v1_listener, es);
+    if (!de->is_egl &&
+        strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+        es->linux_dmabuf_v1 = wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 2);
+        zwp_linux_dmabuf_v1_add_listener(es->linux_dmabuf_v1, &linux_dmabuf_v1_listener, es);
     }
-    if (strcmp(interface, wl_subcompositor_interface.name) == 0)
-        es->w_subcompositor = wl_registry_bind(registry, id, &wl_subcompositor_interface, 1);
+
     if (strcmp(interface, xdg_wm_base_interface.name) == 0)
     {
-        es->XDGWMBase = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
-        xdg_wm_base_add_listener(es->XDGWMBase, &xdg_wm_base_listener, NULL);
+        es->wm_base = wl_registry_bind(registry, id, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(es->wm_base, &xdg_wm_base_listener, NULL);
     }
     if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0)
-        es->x_decoration = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
+        es->decoration_manager = wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
     if (strcmp(interface, wp_viewporter_interface.name) == 0)
-        es->w_viewporter = wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
+        es->viewporter = wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
 }
 
 static void global_registry_remover(void *data, struct wl_registry *registry, uint32_t id)
@@ -881,7 +884,7 @@ static void global_registry_remover(void *data, struct wl_registry *registry, ui
 }
 
 static int
-get_display_and_registry(window_ctx_t * const wc)
+get_display_and_registry(struct egl_wayland_out_env * const de, window_ctx_t * const wc)
 {
 
     struct wl_display * const display = wl_display_connect(NULL);
@@ -904,7 +907,7 @@ get_display_and_registry(window_ctx_t * const wc)
         goto fail;
     }
 
-    wl_registry_add_listener(registry, &global_registry_listener, wc);
+    wl_registry_add_listener(registry, &global_registry_listener, de);
 
     // This calls the attached listener global_registry_handler
     wl_display_roundtrip(display);
@@ -912,7 +915,7 @@ get_display_and_registry(window_ctx_t * const wc)
     // after bind are now done
     wl_display_roundtrip(display);
 
-    wc->native_display = display;
+    wc->w_display = display;
     // Don't need this anymore
     // In theory supported extensions are dynamic - ignore that
     wl_registry_destroy(registry);
@@ -929,20 +932,22 @@ fail:
 static void
 destroy_window(window_ctx_t * const es)
 {
+    if (es->egl_surface)
+        eglDestroySurface(es->egl_display, es->egl_surface);
+    if (es->egl_context)
+        eglDestroyContext(es->egl_display, es->egl_context);
+
+    if (es->w_egl_window)
+        wl_egl_window_destroy(es->w_egl_window);
+
+    if (es->decoration)
+        zxdg_toplevel_decoration_v1_destroy(es->decoration);
+    if (es->wm_toplevel)
+        xdg_toplevel_destroy(es->wm_toplevel);
+    if (es->wm_surface)
+        xdg_surface_destroy(es->wm_surface);
     if (es->surface)
-        eglDestroySurface(es->display, es->surface);
-    if (es->context)
-        eglDestroyContext(es->display, es->context);
-
-    if (es->native_window)
-        wl_egl_window_destroy(es->native_window);   // **** GL?
-
-    if (es->XDGToplevel)
-        xdg_toplevel_destroy(es->XDGToplevel);
-    if (es->XDGSurface)
-        xdg_surface_destroy(es->XDGSurface);
-    if (es->w_surface)
-        wl_surface_destroy(es->w_surface);
+        wl_surface_destroy(es->surface);
 }
 
 void
@@ -985,10 +990,12 @@ int egl_wayland_out_display(struct egl_wayland_out_env *de, AVFrame *src_frame)
         return AVERROR(EINVAL);
     }
 
-    // Really hacky sync
-    while (de->show_all && de->q_next)
+    // If show_all then wait for q_next to be empty otherwise
+    // (run decode @ max speed) just plow on
+    if (de->show_all)
     {
-        usleep(3000);
+        while (sem_wait(&de->q_sem) == 0 && errno == EINTR)
+            /* Loop */;
     }
 
     pthread_mutex_lock(&de->q_lock);
@@ -1013,7 +1020,7 @@ static void
 pollq_pre_cb(void * v, struct pollfd * pfd)
 {
     window_ctx_t * const wc = v;
-    struct wl_display *const display = wc->native_display;
+    struct wl_display *const display = wc->w_display;
     int ferr;
     int frv;
 
@@ -1041,7 +1048,7 @@ static void
 pollq_post_cb(void *v, short revents)
 {
     window_ctx_t * const wc = v;
-    struct wl_display *const display = wc->native_display;
+    struct wl_display *const display = wc->w_display;
     int n;
 
     if ((revents & POLLIN) == 0) {
@@ -1069,8 +1076,6 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
 
     LOG("<<< %s\n", __func__);
 
-    de->q_terminate = 1;
-
     pollqueue_unref(&es->pq);
 
     pthread_mutex_destroy(&de->q_lock);
@@ -1080,7 +1085,7 @@ void egl_wayland_out_delete(struct egl_wayland_out_env *de)
     LOG(">>> %s\n", __func__);
 
     destroy_window(es);
-    wl_display_disconnect(es->native_display);
+    wl_display_disconnect(es->w_display);
     LOG("Display disconnected !\n");
 
     free(de);
@@ -1095,7 +1100,6 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 
     LOG("<<< %s\n", __func__);
 
-    de->q_terminate = 0;
     de->is_egl = is_egl;
     de->show_all = true;
 
@@ -1104,46 +1108,68 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
     es->req_h = WINDOW_HEIGHT;
 
     pthread_mutex_init(&de->q_lock, NULL);
-    sem_init(&de->display_start_sem, 0, 0);
+    sem_init(&de->egl_setup_sem, 0, 0);
+    sem_init(&de->q_sem, 0, 1);
 
-    if (get_display_and_registry(es) != 0)
+    if (get_display_and_registry(de, es) != 0)
         goto fail;
 
-    // *** Check we have all the extensions we need
+    if (!es->compositor)
+    {
+        LOG("Missing wayland compositor\n");
+        goto fail;
+    }
+    if (!es->viewporter)
+    {
+        LOG("Missing wayland viewporter\n");
+        goto fail;
+    }
+    if (!es->wm_base)
+    {
+        LOG("Missing xdg window manager\n");
+        goto fail;
+    }
+    if (!de->is_egl && !es->linux_dmabuf_v1)
+    {
+        LOG("Missing wayland linux_dmabuf extension\n");
+        goto fail;
+    }
 
-    if ((es->w_surface = wl_compositor_create_surface(es->w_compositor)) == NULL)
+    if ((es->surface = wl_compositor_create_surface(es->compositor)) == NULL)
     {
         LOG("No Compositor surface\n");
         goto fail;
     }
 
-    es->w_viewport = wp_viewporter_get_viewport(es->w_viewporter, es->w_surface);
-    es->XDGSurface = xdg_wm_base_get_xdg_surface(es->XDGWMBase, es->w_surface);
+    es->viewport = wp_viewporter_get_viewport(es->viewporter, es->surface);
+    es->wm_surface = xdg_wm_base_get_xdg_surface(es->wm_base, es->surface);
 
-    xdg_surface_add_listener(es->XDGSurface, &xdg_surface_listener, de);
+    xdg_surface_add_listener(es->wm_surface, &xdg_surface_listener, de);
 
-    es->XDGToplevel = xdg_surface_get_toplevel(es->XDGSurface);
-    xdg_toplevel_add_listener(es->XDGToplevel, &xdg_toplevel_listener, es);
+    es->wm_toplevel = xdg_surface_get_toplevel(es->wm_surface);
+    xdg_toplevel_add_listener(es->wm_toplevel, &xdg_toplevel_listener, es);
 
-    xdg_toplevel_set_title(es->XDGToplevel, "Wayland EGL example");
+    xdg_toplevel_set_title(es->wm_toplevel,
+                           de->is_egl ? "EGL video" : "Dmabuf video");
+
     if (fullscreen)
-        xdg_toplevel_set_fullscreen(es->XDGToplevel, NULL);
+        xdg_toplevel_set_fullscreen(es->wm_toplevel, NULL);
 
-    if (!es->x_decoration) {
+    if (!es->decoration_manager) {
         LOG("No decoration manager\n");
     }
     else {
-        struct zxdg_toplevel_decoration_v1 * const decobj =
-            zxdg_decoration_manager_v1_get_toplevel_decoration(es->x_decoration, es->XDGToplevel);
-        zxdg_toplevel_decoration_v1_set_mode(decobj, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
-        zxdg_toplevel_decoration_v1_add_listener(decobj, &decoration_listener, es);
+        es->decoration =
+            zxdg_decoration_manager_v1_get_toplevel_decoration(es->decoration_manager, es->wm_toplevel);
+        zxdg_toplevel_decoration_v1_add_listener(es->decoration, &decoration_listener, es);
+        zxdg_toplevel_decoration_v1_set_mode(es->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
     {
-        struct wl_region * const region = wl_compositor_create_region(es->w_compositor);
+        struct wl_region * const region = wl_compositor_create_region(es->compositor);
 
         wl_region_add(region, 0, 0, es->req_w, es->req_h);
-        wl_surface_set_opaque_region(es->w_surface, region);
+        wl_surface_set_opaque_region(es->surface, region);
         wl_region_destroy(region);
 
         LOG("%s: %dx%d\n", __func__, es->req_w, es->req_h);
@@ -1152,7 +1178,7 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
     }
 
 
-    wl_surface_commit(es->w_surface);
+    wl_surface_commit(es->surface);
 
     es->pq = pollqueue_new();
     pollqueue_set_pre_post(es->pq, pollq_pre_cb, pollq_post_cb, es);
@@ -1161,7 +1187,15 @@ wayland_out_new(const bool is_egl, const bool fullscreen)
 
     // Some egl setup must be done on display thread
     if (de->is_egl)
+    {
         pollqueue_callback_once(es->pq, do_egl_setup, de);
+        sem_wait(&de->egl_setup_sem);
+        if (de->egl_setup_fail)
+        {
+            LOG("EGL init failed\n");
+            goto fail;
+        }
+    }
 
     return de;
 
